@@ -1,0 +1,48 @@
+# Electron Builder config for Harvoost tray.
+#
+# v1 ships UNSIGNED (architecture decision r2). Signing is a v1.1 work item;
+# see ARCHITECTURE.md § Tray distribution for the install-friction documentation
+# IT must provide to end users (Gatekeeper / SmartScreen overrides).
+
+appId: com.harvoost.tray
+productName: Harvoost
+copyright: Copyright (c) 2026 Harvoost
+asar: true
+forceCodeSigning: false
+
+directories:
+  output: out
+  buildResources: main/tray-icons
+
+files:
+  - dist/**/*
+  - renderer/dist/**/*
+  - "package.json"
+  - "!**/*.map"
+
+protocols:
+  - name: Harvoost OIDC callback
+    schemes:
+      - harvoost
+
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.productivity
+  identity: null # explicit: do NOT sign in v1
+
+win:
+  target:
+    - nsis
+  signAndEditExecutable: false
+
+linux:
+  target:
+    - deb
+    - AppImage
+  category: Office
+  desktop:
+    Name: Harvoost
+    Comment: Time tracking + mood capture
+    Categories: Office;Utility;

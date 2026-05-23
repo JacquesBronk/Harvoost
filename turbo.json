@@ -1,0 +1,68 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "globalDependencies": [".env", ".env.local", "tsconfig.base.json"],
+  "globalEnv": [
+    "NODE_ENV",
+    "DATABASE_URL",
+    "SHADOW_DATABASE_URL",
+    "PORT",
+    "WORKER_MODE",
+    "LLM_PROVIDER",
+    "LLM_MODEL_ID",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "XAI_API_KEY",
+    "OLLAMA_BASE_URL",
+    "ENTRA_TENANT_ID",
+    "ENTRA_CLIENT_ID",
+    "ENTRA_CLIENT_SECRET",
+    "ENTRA_REDIRECT_URI_WEB",
+    "ENTRA_REDIRECT_URI_TRAY",
+    "BLOB_STORAGE_CONNECTION_STRING",
+    "BLOB_EXPORTS_CONTAINER",
+    "APPINSIGHTS_CONNECTION_STRING",
+    "ACS_EMAIL_CONNECTION_STRING",
+    "ACS_EMAIL_SENDER_ADDRESS",
+    "SESSION_SECRET",
+    "AUDIT_HASH_SECRET",
+    "BOOTSTRAP_ADMIN_EMAIL",
+    "CORS_ALLOWED_ORIGINS",
+    "WEB_ORIGIN",
+    "REDIS_URL"
+  ],
+  "tasks": {
+    "db:generate": {
+      "cache": true,
+      "inputs": ["prisma/schema.prisma"],
+      "outputs": ["node_modules/.prisma/**", "node_modules/@prisma/client/**"]
+    },
+    "build": {
+      "dependsOn": ["^build", "^db:generate"],
+      "inputs": ["$TURBO_DEFAULT$", "!**/*.test.ts", "!**/__tests__/**"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**", "build/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "dependsOn": ["^db:generate"]
+    },
+    "lint": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^build", "^db:generate"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build", "^db:generate"],
+      "outputs": ["coverage/**"]
+    },
+    "clean": {
+      "cache": false,
+      "outputs": []
+    }
+  }
+}

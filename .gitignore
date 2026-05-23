@@ -18,3 +18,11 @@ __pycache__/
 *.pyc
 dist/
 build/
+out/
+.next/
+.turbo/
+coverage/
+*.log
+*.tsbuildinfo
+playwright-report/
+test-results/

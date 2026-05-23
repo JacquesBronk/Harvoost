@@ -1,0 +1,239 @@
+# Harvoost full local stack — dev infrastructure + app services.
+#
+# Usage:
+#   docker compose up -d --build      # boots EVERYTHING (postgres, azurite, maildev,
+#                                     # keycloak, migrate-and-seed, api, web)
+#   docker compose --profile llm up -d  # also boots ollama for local LLM testing
+#   docker compose down               # stops everything; volumes preserved
+#   docker compose down -v            # ALSO removes volumes (destroys local data)
+#
+# Service start order (compose enforces via depends_on conditions):
+#   postgres + keycloak + azurite + maildev   →  healthy
+#   migrate                                    →  applies migrations + seed, exits 0
+#   api                                        →  starts after migrate completes
+#   web                                        →  starts after api is healthy
+#
+# Networking note: api/web/migrate use `network_mode: host`. On WSL2 + Docker
+# Desktop they share the WSL2 VM's network namespace, so `localhost:5432`
+# (postgres), `localhost:8080` (keycloak), and the api's `localhost:3001`
+# resolve to the same loopback the browser uses. This makes the OIDC iss claim
+# (`http://localhost:8080/realms/harvoost`) match between browser-issued tokens
+# and api-side validation — without this, a bridge-network setup would need
+# /etc/hosts trickery for Keycloak to advertise a single canonical issuer URL.
+#
+# All exposed infra services bind to 127.0.0.1 only. Do not expose externally.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: harvoost-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: harvoost
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: harvoost
+      # Enable extensions we need (btree_gist, pgcrypto, citext) — installed
+      # by the Prisma init migration; alpine image ships the extensions ready
+      # to CREATE EXTENSION.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./packages/db/docker/init-shadow-db.sql:/docker-entrypoint-initdb.d/01-init-shadow-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harvoost -d harvoost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: harvoost-azurite
+    restart: unless-stopped
+    command: "azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --location /data --skipApiVersionCheck"
+    ports:
+      - "127.0.0.1:10000:10000"  # Blob
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 10000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  maildev:
+    image: maildev/maildev:latest
+    container_name: harvoost-maildev
+    restart: unless-stopped
+    environment:
+      MAILDEV_WEB_PORT: 1080
+      MAILDEV_SMTP_PORT: 1025
+    ports:
+      - "127.0.0.1:1080:1080"  # Web UI
+      - "127.0.0.1:1025:1025"  # SMTP
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 1080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OPT-IN: Ollama for local LLM testing. Boot with:
+  #   docker compose --profile llm up -d
+  # After first start, pull a tool-calling-capable model:
+  #   docker exec -it harvoost-ollama ollama pull llama3.1
+  ollama:
+    image: ollama/ollama:latest
+    container_name: harvoost-ollama
+    restart: unless-stopped
+    profiles: ["llm"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # Uncomment to enable GPU passthrough on Linux hosts with nvidia-container-toolkit:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Dev OIDC IdP. Per ADR-0001, OIDC is provider-agnostic: the same code path
+  # in apps/api validates id_tokens against whatever issuer OIDC_ISSUER_URL
+  # points to. In dev that's this Keycloak; in prod it's Entra ID.
+  # The realm import seeds the harvoost-web + harvoost-tray clients and a
+  # fixture set of users matching packages/db/prisma/seed.ts. Admin console:
+  # http://localhost:8080/admin (admin / dev-admin-not-for-prod). Reset the
+  # realm by removing the keycloak-data volume.
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    container_name: harvoost-keycloak
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --import-realm
+      - --hostname-strict=false
+      # Stable issuer URL — the same hostname is advertised in tokens (iss claim),
+      # in the discovery doc, and in the OIDC redirect chain. The browser resolves
+      # harvoost.localhost → 127.0.0.1 via the RFC-6761 .localhost TLD magic
+      # (Chrome/Edge/Firefox/Safari all honour it). The api container resolves it
+      # via `extra_hosts: harvoost.localhost:host-gateway` → host port 8080 here.
+      # Passed as CLI flag (not env) because start-dev ignores some KC_* env vars.
+      # Keycloak 25 uses hostname:v2 by default — `--hostname` takes a full URL.
+      - --hostname=http://harvoost.localhost:8080
+      - --hostname-admin=http://harvoost.localhost:8080
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: dev-admin-not-for-prod
+      KC_DB: dev-file
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./infra/keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # App services: migrate (one-shot) -> api -> web.
+  # ---------------------------------------------------------------------------
+
+  # One-shot: waits for postgres, applies migrations, seeds the dev fixture.
+  # Exits 0 on success. api + web depend on this completing successfully.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    image: harvoost-api:dev
+    container_name: harvoost-migrate
+    env_file: .env
+    environment:
+      # Override .env localhost values with bridge-network DNS names.
+      DATABASE_URL: postgresql://harvoost:dev@postgres:5432/harvoost?sslmode=disable
+      SHADOW_DATABASE_URL: postgresql://harvoost:dev@postgres:5432/harvoost_shadow?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    command: ["bash", "/app/scripts/migrate-and-seed.sh"]
+
+  # NestJS API on :3001 — exposes /v1/* endpoints + SSE sync stream.
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    image: harvoost-api:dev
+    container_name: harvoost-api
+    env_file: .env
+    environment:
+      # Override .env localhost values: postgres + maildev reached via Docker DNS;
+      # blob via azurite service name; keycloak via the shared harvoost.localhost
+      # alias (so iss claim in browser-issued tokens matches what the api validates).
+      DATABASE_URL: postgresql://harvoost:dev@postgres:5432/harvoost?sslmode=disable
+      OIDC_ISSUER_URL: http://harvoost.localhost:8080/realms/harvoost
+      BLOB_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      # Cookie-auth: the web sends Origin=http://localhost:3000 — matches above.
+    extra_hosts:
+      # Maps harvoost.localhost inside the api container to the Docker host's
+      # gateway IP, which forwards via the keycloak port mapping above. The
+      # browser resolves the SAME hostname to 127.0.0.1 (.localhost TLD magic).
+      - "harvoost.localhost:host-gateway"
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/v1/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # Next.js web on :3000 — talks to api at localhost:3001 (from the browser's
+  # perspective). The web container itself only serves static + SSR; it does
+  # not call the api server-side, so it doesn't need extra_hosts.
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    image: harvoost-web:dev
+    container_name: harvoost-web
+    env_file: .env
+    environment:
+      # Override the .env PORT=3001 (which is the api's port).
+      PORT: "3000"
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres-data:
+    name: harvoost-postgres-data
+  azurite-data:
+    name: harvoost-azurite-data
+  ollama-data:
+    name: harvoost-ollama-data
+  keycloak-data:
+    name: harvoost-keycloak-data

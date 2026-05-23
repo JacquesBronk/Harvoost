@@ -1,0 +1,56 @@
+{
+  "name": "harvoost",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Harvest-style time-tracking SaaS with tray app, RBAC, mood capture, approvals, scheduling, exceptions, financial dashboards, chatbot, and weekly summaries.",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "build:web": "pnpm --filter @harvoost/web build",
+    "dev": "turbo run dev --parallel",
+    "dev:api": "pnpm --filter @harvoost/api dev",
+    "dev:web": "pnpm --filter @harvoost/web dev",
+    "start:web": "pnpm --filter @harvoost/web start:standalone",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\" --ignore-path .gitignore",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\" --ignore-path .gitignore",
+    "compose:up": "docker compose up -d postgres azurite maildev keycloak",
+    "compose:down": "docker compose down",
+    "compose:logs": "docker compose logs -f",
+    "migrate": "pnpm --filter @harvoost/db migrate:deploy",
+    "seed": "pnpm --filter @harvoost/db seed",
+    "setup": "pnpm install && docker compose up -d postgres azurite maildev keycloak && pnpm migrate && pnpm seed && pnpm --filter @harvoost/web build",
+    "db:generate": "pnpm --filter @harvoost/db prisma:generate",
+    "db:migrate": "pnpm --filter @harvoost/db migrate:dev",
+    "db:migrate:deploy": "pnpm --filter @harvoost/db migrate:deploy",
+    "db:seed": "pnpm --filter @harvoost/db seed",
+    "db:reset": "pnpm --filter @harvoost/db reset",
+    "db:studio": "pnpm --filter @harvoost/db studio",
+    "e2e": "pnpm --filter @harvoost/e2e test",
+    "e2e:live": "pnpm --filter @harvoost/e2e test:live",
+    "e2e:install": "pnpm --filter @harvoost/e2e install-browsers",
+    "docker:up": "docker compose up -d",
+    "docker:up:llm": "docker compose --profile llm up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "clean": "turbo run clean && rm -rf node_modules .turbo"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "eslint": "^9.10.0",
+    "prettier": "^3.3.3",
+    "turbo": "^2.1.0",
+    "typescript": "^5.5.4"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": []
+    }
+  }
+}

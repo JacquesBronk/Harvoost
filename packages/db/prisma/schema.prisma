@@ -1,0 +1,624 @@
+// Harvoost — Prisma schema (canonical)
+//
+// Source of truth: 02-architecture/ARCHITECTURE.md § Data model.
+// 26 functional tables + 2 admin/config singletons (admin_email_allowlist, org_settings).
+//
+// Conventions:
+//   - DB names are snake_case (via @map / @@map). TS client names are camelCase.
+//   - All timestamps are TIMESTAMPTZ (UTC at rest). Date-only fields use DATE.
+//   - Bigint IDs for the high-volume tables; UUID for sessions and chatbot conversations/messages.
+//   - Several constructs (generated columns, EXCLUDE constraints, audit trigger,
+//     helper SQL functions, partial unique indexes that Prisma can't express)
+//     live in prisma/migrations/<init>/migration.sql, NOT in this schema.
+//     See prisma/init.sql for the canonical reference of those constraints.
+//
+// IMPORTANT: When adding fields/tables, mirror the change in the migration SQL
+// (or run `prisma migrate dev --create-only` and review the generated SQL
+// before applying).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [btree_gist, pgcrypto, citext]
+}
+
+// -----------------------------------------------------------------------------
+// Identity & RBAC
+// -----------------------------------------------------------------------------
+
+model User {
+  id                  BigInt   @id @default(autoincrement())
+  entraObjectId       String   @unique @map("entra_object_id")
+  email               String   @unique @db.Citext
+  displayName         String   @map("display_name")
+  timezone            String   @default("Europe/Amsterdam")
+  weeklySummaryOptOut Boolean  @default(false) @map("weekly_summary_opt_out")
+  isActive            Boolean  @default(true) @map("is_active")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // Relations
+  roles                          UserRole[]
+  rolesAssignedByMe              UserRole[]              @relation("UserRoleAssignedBy")
+  reports                        UserManager[]           @relation("UserManagerUser")
+  managedReports                 UserManager[]           @relation("UserManagerManager")
+  projectMemberships             ProjectMember[]
+  projectManagerOf               ProjectManager[]
+  timeEntries                    TimeEntry[]
+  timeEntryStateTransitions      TimeEntryStateHistory[] @relation("TimeEntryStateActor")
+  moodEntries                    MoodEntry[]
+  scheduleTemplate               ScheduleTemplate?
+  scheduleOverridesForMe         ScheduleOverride[]      @relation("ScheduleOverrideUser")
+  scheduleOverridesIAuthored     ScheduleOverride[]      @relation("ScheduleOverrideCreatedBy")
+  leaveRequests                  LeaveRequest[]          @relation("LeaveRequestUser")
+  leaveRequestsApprovedByMe      LeaveRequest[]          @relation("LeaveRequestApprovedBy")
+  exceptions                     Exception[]             @relation("ExceptionUser")
+  exceptionsResolvedByMe         Exception[]             @relation("ExceptionResolvedBy")
+  employeeCostRates              EmployeeCostRate[]      @relation("EmployeeCostRateUser")
+  employeeCostRatesIAuthored     EmployeeCostRate[]      @relation("EmployeeCostRateCreatedBy")
+  projectBillableRatesIAuthored  ProjectBillableRate[]   @relation("ProjectBillableRateCreatedBy")
+  auditEntries                   AuditLog[]
+  emailDeliveries                EmailDeliveryLog[]
+  chatbotToolInvocations         ChatbotToolInvocation[]
+  chatbotConversations           ChatbotConversation[]
+  sessions                       Session[]
+  notifications                  Notification[]
+  orgSettingsUpdatesIAuthored    OrgSetting[]
+
+  @@index([isActive])
+  @@map("users")
+}
+
+model UserRole {
+  id           BigInt   @id @default(autoincrement())
+  userId       BigInt   @map("user_id")
+  role         String // 'admin' | 'finmgr' | 'manager' | 'employee' — CHECK in DB
+  assignedBy   BigInt?  @map("assigned_by")
+  assignedAt   DateTime @default(now()) @map("assigned_at") @db.Timestamptz(6)
+
+  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedByUser User? @relation("UserRoleAssignedBy", fields: [assignedBy], references: [id], onDelete: SetNull)
+
+  @@unique([userId, role])
+  @@index([userId])
+  @@map("user_roles")
+}
+
+model UserManager {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")    // the report
+  managerId BigInt   @map("manager_id") // the manager
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user    User @relation("UserManagerUser", fields: [userId], references: [id], onDelete: Cascade)
+  manager User @relation("UserManagerManager", fields: [managerId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, managerId])
+  @@index([managerId])
+  @@index([userId])
+  @@map("user_managers")
+}
+
+// -----------------------------------------------------------------------------
+// Clients, Projects, Tasks, Members, Managers
+// -----------------------------------------------------------------------------
+
+model Client {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  projects Project[]
+
+  @@index([name])
+  @@map("clients")
+}
+
+model Project {
+  id              BigInt   @id @default(autoincrement())
+  clientId        BigInt   @map("client_id")
+  code            String?  @unique
+  name            String
+  billingMode     String   @map("billing_mode") // 'hourly' | 'fixed_fee' | 'non_billable' — CHECK in DB
+  fixedFeeAmount  Decimal? @map("fixed_fee_amount") @db.Decimal(14, 2)
+  currency        String   @db.Char(3)
+  hoursBudget     Decimal? @map("hours_budget") @db.Decimal(8, 2)
+  isActive        Boolean  @default(true) @map("is_active")
+  department      String?
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  client                Client                       @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  members               ProjectMember[]
+  managers              ProjectManager[]
+  tasks                 ProjectTask[]
+  billableRates         ProjectBillableRate[]
+  billingModeHistory    ProjectBillingModeHistory[]
+  timeEntries           TimeEntry[]
+  scheduleOverrides     ScheduleOverride[]           @relation("ScheduleOverrideProject")
+
+  @@index([clientId])
+  @@index([isActive])
+  @@map("projects")
+}
+
+model ProjectBillingModeHistory {
+  id            BigInt   @id @default(autoincrement())
+  projectId     BigInt   @map("project_id")
+  billingMode   String   @map("billing_mode")
+  effectiveFrom DateTime @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, effectiveFrom])
+  @@map("project_billing_mode_history")
+}
+
+model ProjectMember {
+  id        BigInt   @id @default(autoincrement())
+  projectId BigInt   @map("project_id")
+  userId    BigInt   @map("user_id")
+  joinedAt  DateTime @default(now()) @map("joined_at") @db.Date
+  leftAt    DateTime? @map("left_at") @db.Date
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, leftAt])
+  @@index([projectId, leftAt])
+  @@map("project_members")
+}
+
+model ProjectManager {
+  id         BigInt   @id @default(autoincrement())
+  projectId  BigInt   @map("project_id")
+  managerId  BigInt   @map("manager_id")
+  assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  manager User    @relation(fields: [managerId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, managerId])
+  @@index([managerId])
+  @@index([projectId])
+  @@map("project_managers")
+}
+
+model ProjectTask {
+  id         BigInt  @id @default(autoincrement())
+  projectId  BigInt  @map("project_id")
+  name       String
+  isBillable Boolean @default(true) @map("is_billable")
+  isActive   Boolean @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  project       Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  billableRates ProjectBillableRate[]
+  timeEntries   TimeEntry[]
+
+  @@index([projectId])
+  @@map("project_tasks")
+}
+
+model ProjectBillableRate {
+  id            BigInt   @id @default(autoincrement())
+  projectId     BigInt   @map("project_id")
+  taskId        BigInt?  @map("task_id")
+  rate          Decimal  @db.Decimal(10, 2)
+  currency      String   @db.Char(3)
+  effectiveFrom DateTime @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  createdBy     BigInt   @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  project       Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task          ProjectTask? @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdByUser User         @relation("ProjectBillableRateCreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([projectId, taskId, effectiveFrom])
+  @@map("project_billable_rates")
+}
+
+model EmployeeCostRate {
+  id            BigInt   @id @default(autoincrement())
+  userId        BigInt   @map("user_id")
+  rate          Decimal  @db.Decimal(10, 2)
+  currency      String   @db.Char(3)
+  effectiveFrom DateTime @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  createdBy     BigInt   @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user          User @relation("EmployeeCostRateUser", fields: [userId], references: [id], onDelete: Cascade)
+  createdByUser User @relation("EmployeeCostRateCreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([userId, effectiveFrom])
+  @@map("employee_cost_rates")
+}
+
+// -----------------------------------------------------------------------------
+// Time entries
+// -----------------------------------------------------------------------------
+
+model TimeEntry {
+  id              BigInt    @id @default(autoincrement())
+  userId          BigInt    @map("user_id")
+  projectId       BigInt    @map("project_id")
+  taskId          BigInt?   @map("task_id")
+  notes           String?
+  startAt         DateTime  @map("start_at") @db.Timestamptz(6)
+  endAt           DateTime? @map("end_at") @db.Timestamptz(6)
+  // time_range tstzrange GENERATED ALWAYS AS (tstzrange(start_at, end_at, '[)')) STORED
+  // — declared in migration SQL; Prisma can't express generated columns natively,
+  // so we use Unsupported to keep introspection happy.
+  timeRange       Unsupported("tstzrange")? @map("time_range")
+  status          String // 'running' | 'draft' | 'submitted' | 'manager_approved' | 'final_approved' | 'rejected'
+  billable        Boolean   @default(true)
+  moodScore       Int?      @map("mood_score") @db.SmallInt
+  idempotencyKey  String?   @map("idempotency_key")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project      @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  task    ProjectTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  history TimeEntryStateHistory[]
+
+  // Note: EXCLUDE constraint, partial unique indexes (running per user,
+  // idempotency_key per user) all live in the migration SQL.
+  @@index([userId, startAt(sort: Desc)])
+  @@index([projectId, startAt(sort: Desc)])
+  @@index([status])
+  @@index([status, startAt])
+  @@index([startAt])
+  @@index([userId, status, startAt])
+  @@map("time_entries")
+}
+
+model TimeEntryStateHistory {
+  id          BigInt   @id @default(autoincrement())
+  timeEntryId BigInt   @map("time_entry_id")
+  fromStatus  String?  @map("from_status")
+  toStatus    String   @map("to_status")
+  actorId     BigInt   @map("actor_id")
+  reason      String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  timeEntry TimeEntry @relation(fields: [timeEntryId], references: [id], onDelete: Cascade)
+  actor     User      @relation("TimeEntryStateActor", fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([timeEntryId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("time_entry_state_history")
+}
+
+// -----------------------------------------------------------------------------
+// Mood
+// -----------------------------------------------------------------------------
+
+model MoodEntry {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")
+  localDate DateTime @map("local_date") @db.Date
+  score     Int      @db.SmallInt // CHECK 1..5 enforced in DB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, localDate])
+  @@index([userId, localDate(sort: Desc)])
+  @@index([createdAt])
+  @@map("mood_entries")
+}
+
+model MoodWeeklyAggregate {
+  id          BigInt   @id @default(autoincrement())
+  teamAnchor  String   @map("team_anchor") // e.g. 'proj:42' or 'mgr:17'
+  isoYear     Int      @map("iso_year")
+  isoWeek     Int      @map("iso_week")
+  sampleSize  Int      @map("sample_size")
+  scoreAvg    Decimal  @map("score_avg") @db.Decimal(3, 2)
+  scoreStdev  Decimal? @map("score_stdev") @db.Decimal(3, 2)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([teamAnchor, isoYear, isoWeek])
+  @@map("mood_weekly_aggregates")
+}
+
+// -----------------------------------------------------------------------------
+// Schedules
+// -----------------------------------------------------------------------------
+
+model ScheduleTemplate {
+  id             BigInt    @id @default(autoincrement())
+  userId         BigInt    @unique @map("user_id")
+  workingDays    Int[]     @default([1, 2, 3, 4, 5]) @map("working_days") @db.SmallInt
+  startTime      DateTime  @default(dbgenerated("'08:00'::time")) @map("start_time") @db.Time(0)
+  endTime        DateTime  @default(dbgenerated("'17:00'::time")) @map("end_time") @db.Time(0)
+  lunchStartTime DateTime? @default(dbgenerated("'12:00'::time")) @map("lunch_start_time") @db.Time(0)
+  lunchEndTime   DateTime? @default(dbgenerated("'13:00'::time")) @map("lunch_end_time") @db.Time(0)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("schedule_templates")
+}
+
+model ScheduleOverride {
+  id             BigInt   @id @default(autoincrement())
+  scope          String // 'user' | 'project' | 'org' — CHECK in DB
+  userId         BigInt?  @map("user_id")
+  projectId      BigInt?  @map("project_id")
+  effectiveFrom  DateTime @map("effective_from") @db.Date
+  effectiveTo    DateTime @map("effective_to") @db.Date
+  startTime      DateTime? @map("start_time") @db.Time(0)
+  endTime        DateTime? @map("end_time") @db.Time(0)
+  lunchStartTime DateTime? @map("lunch_start_time") @db.Time(0)
+  lunchEndTime   DateTime? @map("lunch_end_time") @db.Time(0)
+  reason         String?
+  createdBy      BigInt   @map("created_by")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user          User?    @relation("ScheduleOverrideUser", fields: [userId], references: [id], onDelete: Cascade)
+  project       Project? @relation("ScheduleOverrideProject", fields: [projectId], references: [id], onDelete: Cascade)
+  createdByUser User     @relation("ScheduleOverrideCreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([scope, userId, effectiveFrom])
+  @@index([scope, projectId, effectiveFrom])
+  @@map("schedule_overrides")
+}
+
+// -----------------------------------------------------------------------------
+// Leave
+// -----------------------------------------------------------------------------
+
+model LeaveRequest {
+  id                BigInt    @id @default(autoincrement())
+  userId            BigInt    @map("user_id")
+  leaveType         String    @map("leave_type") // 'annual' | 'sick' | 'unpaid' | 'other'
+  startDate         DateTime  @map("start_date") @db.Date
+  endDate           DateTime  @map("end_date") @db.Date
+  halfDay           String?   @map("half_day") // 'am' | 'pm' | null
+  note              String?
+  status            String // 'pending' | 'approved' | 'rejected' | 'cancelled'
+  approvedBy        BigInt?   @map("approved_by")
+  approvedAt        DateTime? @map("approved_at") @db.Timestamptz(6)
+  rejectionReason   String?   @map("rejection_reason")
+  bambooRequestId   String?   @map("bamboo_request_id")
+  bambooSyncStatus  String    @default("not_applicable") @map("bamboo_sync_status")
+  bambooSyncedAt    DateTime? @map("bamboo_synced_at") @db.Timestamptz(6)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user           User  @relation("LeaveRequestUser", fields: [userId], references: [id], onDelete: Cascade)
+  approvedByUser User? @relation("LeaveRequestApprovedBy", fields: [approvedBy], references: [id], onDelete: SetNull)
+
+  @@index([userId, startDate])
+  @@index([status, startDate])
+  @@map("leave_requests")
+}
+
+// -----------------------------------------------------------------------------
+// Exceptions
+// -----------------------------------------------------------------------------
+
+model Exception {
+  id             BigInt   @id @default(autoincrement())
+  userId         BigInt   @map("user_id")
+  exceptionType  String   @map("exception_type") // MISSED_PUNCH | OVERTIME_DAY | OVERTIME_WEEK | ANOMALY_LOW | ANOMALY_HIGH
+  localDate      DateTime @map("local_date") @db.Date
+  details        Json     @db.JsonB
+  status         String // 'open' | 'resolved' | 'dismissed'
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz(6)
+  resolvedBy     BigInt?   @map("resolved_by")
+  resolutionNote String?   @map("resolution_note")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user          User  @relation("ExceptionUser", fields: [userId], references: [id], onDelete: Cascade)
+  resolvedByUser User? @relation("ExceptionResolvedBy", fields: [resolvedBy], references: [id], onDelete: SetNull)
+
+  @@unique([userId, exceptionType, localDate])
+  @@index([userId, status, localDate])
+  @@index([status, localDate])
+  @@map("exceptions")
+}
+
+// -----------------------------------------------------------------------------
+// Audit log (append-only, hash-chained)
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  actorId     BigInt?  @map("actor_id")
+  action      String
+  entityType  String?  @map("entity_type")
+  entityId    String?  @map("entity_id")
+  before      Json?    @db.JsonB
+  after       Json?    @db.JsonB
+  reason      String?
+  prevRowHash String?  @map("prev_row_hash") @db.Char(64)
+  rowHash     String   @map("row_hash") @db.Char(64)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_log")
+}
+
+// -----------------------------------------------------------------------------
+// Email delivery log
+// -----------------------------------------------------------------------------
+
+model EmailDeliveryLog {
+  id                 BigInt    @id @default(autoincrement())
+  userId             BigInt?   @map("user_id")
+  kind               String
+  summaryPeriodStart DateTime? @map("summary_period_start") @db.Date
+  summaryPeriodEnd   DateTime? @map("summary_period_end") @db.Date
+  status             String // 'queued' | 'sent' | 'failed' | 'suppressed'
+  mode               String? // 'llm' | 'template' — only for weekly_summary
+  messageId          String?   @map("message_id")
+  errorDetail        String?   @map("error_detail")
+  sentAt             DateTime? @map("sent_at") @db.Timestamptz(6)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("email_delivery_log")
+}
+
+// -----------------------------------------------------------------------------
+// Chatbot
+// -----------------------------------------------------------------------------
+
+model ChatbotToolInvocation {
+  id               BigInt   @id @default(autoincrement())
+  userId           BigInt   @map("user_id")
+  prompt           String
+  toolName         String   @map("tool_name")
+  toolParams       Json     @map("tool_params") @db.JsonB
+  resultRowCount   Int?     @map("result_row_count")
+  resultTruncated  Boolean  @default(false) @map("result_truncated")
+  tokensIn         Int?     @map("tokens_in")
+  tokensOut        Int?     @map("tokens_out")
+  latencyMs        Int?     @map("latency_ms")
+  status           String // 'ok' | 'tool_error' | 'llm_error' | 'rate_limited' | 'out_of_scope'
+  errorDetail      String?  @map("error_detail")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("chatbot_tool_invocations")
+}
+
+model ChatbotConversation {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        BigInt   @map("user_id")
+  startedAt     DateTime @default(now()) @map("started_at") @db.Timestamptz(6)
+  lastMessageAt DateTime @default(now()) @map("last_message_at") @db.Timestamptz(6)
+  metadata      Json     @default("{}") @db.JsonB
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ChatbotMessage[]
+
+  @@index([userId, lastMessageAt(sort: Desc)])
+  @@index([lastMessageAt])
+  @@map("chatbot_conversations")
+}
+
+model ChatbotMessage {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  role           String // 'user' | 'assistant' | 'tool' — CHECK in DB
+  content        String?
+  toolName       String?  @map("tool_name")
+  toolCallId     String?  @map("tool_call_id")
+  toolInput      Json?    @map("tool_input") @db.JsonB
+  toolOutput     Json?    @map("tool_output") @db.JsonB
+  tokensIn       Int?     @map("tokens_in")
+  tokensOut      Int?     @map("tokens_out")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  conversation ChatbotConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("chatbot_messages")
+}
+
+// -----------------------------------------------------------------------------
+// Sessions, notifications, allowlist, settings
+// -----------------------------------------------------------------------------
+
+model Session {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            BigInt    @map("user_id")
+  kind              String // 'web' | 'tray'
+  issuedAt          DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(6)
+  refreshTokenHash  String    @map("refresh_token_hash")
+  lastSeenAt        DateTime? @map("last_seen_at") @db.Timestamptz(6)
+  userAgent         String?   @map("user_agent")
+  ip                String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@map("sessions")
+}
+
+model Notification {
+  id        BigInt    @id @default(autoincrement())
+  userId    BigInt    @map("user_id")
+  kind      String
+  payload   Json      @db.JsonB
+  readAt    DateTime? @map("read_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model AdminEmailAllowlist {
+  id      BigInt   @id @default(autoincrement())
+  email   String   @unique @db.Citext
+  addedBy String   @map("added_by")
+  addedAt DateTime @default(now()) @map("added_at") @db.Timestamptz(6)
+
+  @@map("admin_email_allowlist")
+}
+
+// Server-side pending-state for the OIDC login redirect dance (ADR-0001).
+// Rows are short-lived (5 min TTL) and single-use; deleted on successful
+// callback or by a periodic cleanup job.
+model AuthPending {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  state        String
+  nonce        String
+  codeVerifier String   @map("code_verifier")
+  clientKind   String   @map("client_kind") // 'web' | 'tray' — CHECK in DB
+  redirectUri  String   @map("redirect_uri")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(6)
+
+  @@index([expiresAt])
+  @@map("auth_pending")
+}
+
+// Singleton (CHECK id = 1 enforced in DB).
+model OrgSetting {
+  id                       Int      @id @default(1)
+  reportingCurrency        String   @default("EUR") @map("reporting_currency") @db.Char(3)
+  defaultTimezone          String   @default("Europe/Amsterdam") @map("default_timezone")
+  overtimeDailyHours       Decimal  @default(10.00) @map("overtime_daily_hours") @db.Decimal(4, 2)
+  overtimeWeeklyHours      Decimal  @default(50.00) @map("overtime_weekly_hours") @db.Decimal(4, 2)
+  anomalySigma             Decimal  @default(2.00) @map("anomaly_sigma") @db.Decimal(3, 2)
+  chatbotDailyTokenBudget  Int      @default(50000) @map("chatbot_daily_token_budget")
+  exportAsyncThreshold     Int      @default(100000) @map("export_async_threshold")
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  updatedBy                BigInt?  @map("updated_by")
+
+  updatedByUser User? @relation(fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@map("org_settings")
+}

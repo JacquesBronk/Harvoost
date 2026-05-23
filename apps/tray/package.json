@@ -1,0 +1,42 @@
+{
+  "name": "@harvoost/tray",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Harvoost Electron tray app — clock in/out, mood capture, sync with web.",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "tsc -w & electron .",
+    "build": "tsc && vite build -c renderer/vite.config.ts",
+    "build:main": "tsc",
+    "build:renderer": "vite build -c renderer/vite.config.ts",
+    "package": "electron-builder --config electron-builder.yml",
+    "package:dir": "electron-builder --config electron-builder.yml --dir",
+    "lint": "eslint \"main/**/*.ts\" \"preload/**/*.ts\" \"renderer/**/*.{ts,tsx}\"",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist out .turbo"
+  },
+  "dependencies": {
+    "@harvoost/ui": "workspace:*",
+    "better-sqlite3": "^11.3.0",
+    "eventsource-parser": "^3.0.0",
+    "keytar": "^7.9.0",
+    "lucide-react": "^0.451.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "autoprefixer": "^10.4.20",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "eslint": "^9.10.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8"
+  }
+}

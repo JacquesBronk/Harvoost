@@ -1,0 +1,1 @@
+{"version":3,"file":"k-anonymity.d.ts","sourceRoot":"","sources":["k-anonymity.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,WAAW,EAAa,MAAM,oBAAoB,CAAC;AAE5D,qBAAa,eAAgB,SAAQ,WAAW;gBAClC,QAAQ,EAAE,MAAM,EAAE,SAAS,EAAE,MAAM;CAShD;AAGD,wBAAgB,iBAAiB,CAAC,SAAS,EAAE,MAAM,EAAE,CAAC,SAAI,GAAG,MAAM,CAQlE"}

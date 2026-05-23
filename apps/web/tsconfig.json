@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "preserve",
+    "allowJs": true,
+    "noEmit": true,
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@harvoost/ui": ["../../packages/ui/src/index.ts"],
+      "@harvoost/ui/*": ["../../packages/ui/src/*"],
+      "@harvoost/shared": ["../../packages/shared/src/index.ts"],
+      "@harvoost/shared/*": ["../../packages/shared/src/*"]
+    }
+  },
+  "include": ["next-env.d.ts", "app/**/*", "src/**/*", "scripts/**/*", ".next/types/**/*.ts"],
+  "exclude": ["node_modules", ".next", "dist"]
+}

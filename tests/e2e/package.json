@@ -1,0 +1,21 @@
+{
+  "name": "@harvoost/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright end-to-end tests for Harvoost (mocked + live-stack projects).",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:live": "E2E_LIVE=1 playwright test",
+    "test:debug": "PWDEBUG=1 playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:report": "playwright show-report",
+    "install-browsers": "playwright install --with-deps chromium",
+    "install-browsers:live": "playwright install --with-deps chromium firefox"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  }
+}

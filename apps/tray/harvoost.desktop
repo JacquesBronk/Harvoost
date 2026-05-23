@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Harvoost
+Comment=Time tracking with mood capture
+Exec=harvoost
+Icon=harvoost
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=true
+StartupWMClass=Harvoost

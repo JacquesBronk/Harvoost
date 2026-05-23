@@ -1,0 +1,54 @@
+import { describe, it, expect, vi } from 'vitest';
+import { ApprovalsController } from '../../src/approvals/approvals.controller';
+import { RbacForbiddenError } from '@harvoost/shared';
+
+// We construct the controller with a tiny in-memory Prisma stub and assert the invariant:
+// the same user cannot perform both stage-1 (manager_approved) and stage-2 (final_approved)
+// on the same entry.
+function makeController(stage1Actor: string) {
+  const queries: Array<{ sql: string; values: unknown[] }> = [];
+  const prisma = {
+    $queryRawUnsafe: vi.fn(async (sql: string, ...values: unknown[]) => {
+      queries.push({ sql, values });
+      if (sql.includes('FROM time_entry_state_history') && sql.includes("to_status = 'manager_approved'")) {
+        return [{ actor_id: stage1Actor }];
+      }
+      return [];
+    }),
+    $executeRawUnsafe: vi.fn(async () => 1),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new ApprovalsController(prisma as any, { record: async () => undefined } as any);
+}
+
+describe('Two-stage approval invariant', () => {
+  it('rejects stage-2 when actor was also stage-1', async () => {
+    const ctrl = makeController('user-A');
+    await expect(
+      ctrl.finalAction(
+        { userId: 'user-A', email: 'a@h.local', roles: ['finmgr', 'manager'] },
+        { entry_ids: ['100'], action: 'approve' },
+      ),
+    ).rejects.toBeInstanceOf(RbacForbiddenError);
+  });
+
+  it('allows stage-2 by a different actor than stage-1', async () => {
+    const ctrl = makeController('user-A');
+    await expect(
+      ctrl.finalAction(
+        { userId: 'user-B', email: 'b@h.local', roles: ['finmgr'] },
+        { entry_ids: ['100'], action: 'approve' },
+      ),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it('rejects reject-without-reason at stage 2', async () => {
+    const ctrl = makeController('user-A');
+    await expect(
+      ctrl.finalAction(
+        { userId: 'user-B', email: 'b@h.local', roles: ['finmgr'] },
+        { entry_ids: ['100'], action: 'reject' },
+      ),
+    ).rejects.toThrow(/at least 10 characters/i);
+  });
+});

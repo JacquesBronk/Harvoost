@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-neutral-50 text-neutral-900;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Visible focus outline for keyboard users; respected by all interactive primitives. */
+  :focus-visible {
+    outline: none;
+  }
+
+  /* Skip-to-content link */
+  .skip-link {
+    @apply absolute left-2 top-2 -translate-y-12 rounded-md bg-brand-700 px-3 py-2 text-sm font-medium text-white shadow-card transition-transform focus:translate-y-0 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2;
+  }
+}

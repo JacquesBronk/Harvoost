@@ -1,0 +1,58 @@
+# Dockerfile.api — Harvoost API (NestJS + ts-node runtime).
+#
+# Single-stage image used for THREE roles, switched by CMD:
+#   - api      : pnpm --filter @harvoost/api dev   (default)
+#   - worker   : WORKER_MODE=1 pnpm --filter @harvoost/api dev
+#   - migrate  : bash /app/scripts/migrate-and-seed.sh
+#
+# ts-node is used (not the dist build) because:
+#   (a) workspace packages' package.json `main` points at TypeScript source
+#       (works for tests + dev + this container; production-grade dist refactor
+#       is a v1.0.1 follow-up tracked in 07-deploy/TODO_INVENTORY.md)
+#   (b) NestJS DI requires emitDecoratorMetadata which esbuild / tsx don't emit.
+#
+# Build context expected to be the monorepo root.
+
+FROM node:20-alpine
+
+# tini for proper PID-1 signal handling; openssl for Prisma; libc6-compat for
+# native modules; bash so the migrate-and-seed script can use bash niceties.
+RUN apk add --no-cache libc6-compat openssl tini bash
+
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+
+WORKDIR /app
+
+# Workspace + lockfile + tsconfig before sources so this layer caches well.
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml turbo.json tsconfig.base.json ./
+
+# All workspace package.jsons so pnpm install resolves workspace links correctly.
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY apps/tray/package.json apps/tray/
+COPY packages/db/package.json packages/db/
+COPY packages/shared/package.json packages/shared/
+COPY packages/jobs/package.json packages/jobs/
+COPY packages/ui/package.json packages/ui/
+COPY tests/e2e/package.json tests/e2e/
+
+# Install ALL deps (incl. devDeps — ts-node, prisma, tsx for seed).
+RUN pnpm install --frozen-lockfile
+
+# Sources for the packages this image needs at runtime. apps/web + apps/tray
+# are NOT copied; this image is api/worker/migrate only.
+COPY apps/api ./apps/api
+COPY packages/db ./packages/db
+COPY packages/shared ./packages/shared
+COPY packages/jobs ./packages/jobs
+COPY scripts ./scripts
+
+# Generate Prisma client into the resolved pnpm path.
+RUN pnpm --filter @harvoost/db prisma:generate
+
+ENV NODE_ENV=development
+ENV PORT=3001
+EXPOSE 3001
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["pnpm", "--filter", "@harvoost/api", "dev"]

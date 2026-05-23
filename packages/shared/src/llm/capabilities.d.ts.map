@@ -1,0 +1,1 @@
+{"version":3,"file":"capabilities.d.ts","sourceRoot":"","sources":["capabilities.ts"],"names":[],"mappings":"AAGA,MAAM,MAAM,eAAe,GAAG,QAAQ,GAAG,WAAW,GAAG,QAAQ,GAAG,KAAK,GAAG,QAAQ,GAAG,MAAM,CAAC;AAE5F,MAAM,WAAW,kBAAkB;IACjC,aAAa,EAAE,OAAO,CAAC;IACvB,iBAAiB,EAAE,OAAO,CAAC;CAC5B;AAgCD,wBAAgB,gBAAgB,CAAC,QAAQ,EAAE,eAAe,EAAE,OAAO,EAAE,MAAM,GAAG,kBAAkB,CAS/F"}
