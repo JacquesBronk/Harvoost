@@ -24,8 +24,18 @@ export const EnvSchema = z.object({
   OIDC_ISSUER_URL: z.string().url(),
   OIDC_CLIENT_ID: z.string().min(1),
   OIDC_CLIENT_SECRET: z.string().optional(),
-  OIDC_REDIRECT_URI_WEB: z.string().default('http://localhost:3000/v1/auth/callback'),
+  // INC-002 B2: the browser-facing callback must land on the page the web app
+  // serves (`/auth/callback`), NOT the API-shaped `/v1/auth/callback`. This is
+  // the single source of truth for the redirect_uri (the frontend no longer
+  // sends one). Must also be present in infra/keycloak/realm.json's allowlist.
+  OIDC_REDIRECT_URI_WEB: z.string().default('http://localhost:3000/auth/callback'),
   OIDC_REDIRECT_URI_TRAY: z.string().default('harvoost://auth/callback'),
+  // Human-friendly IdP name surfaced on the login page via GET /v1/auth/idp-info.
+  // The OIDC discovery doc carries no display name, so this env var is the
+  // source of truth. Dev: Keycloak. Prod: Microsoft Entra ID. If unset, the
+  // endpoint derives a name from the discovery issuer host, then falls back to
+  // the literal "your identity provider".
+  OIDC_DISPLAY_NAME: z.string().optional(),
 
   // TEST-only bypass — accepts X-Test-User-Id header in NODE_ENV=test ONLY.
   // The boot invariant below refuses TEST_AUTH_BYPASS=true outside NODE_ENV=test.

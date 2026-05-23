@@ -100,6 +100,10 @@ export function AppShell({ children }: { children: ReactNode }) {
     return <>{children}</>;
   }
 
+  // INC-002 defense-in-depth: backend guarantees a non-empty display_name, but
+  // fall back to the email so the shell can never render a blank identity.
+  const displayName = user.display_name?.trim() ? user.display_name : user.email;
+
   async function handleSignOut() {
     try {
       await fetch(`${env.API_BASE_URL.replace(/\/$/, '')}/v1/auth/logout`, {
@@ -166,10 +170,10 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         <div className="mt-auto hidden border-t border-neutral-100 px-3 py-3 lg:block">
           <div className="flex items-center gap-2">
-            <Avatar name={user.display_name} size="md" />
+            <Avatar name={displayName} size="md" />
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium text-neutral-900">
-                {user.display_name}
+                {displayName}
               </div>
               <div className="truncate text-xs text-neutral-500">{user.email}</div>
             </div>

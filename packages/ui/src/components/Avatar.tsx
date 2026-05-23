@@ -2,17 +2,19 @@ import { forwardRef, type HTMLAttributes } from 'react';
 import { cn } from '../lib/cn.js';
 
 export interface AvatarProps extends HTMLAttributes<HTMLDivElement> {
-  name: string;
+  /** Display name to derive initials from. May be undefined/empty while data loads. */
+  name?: string | null;
   size?: 'sm' | 'md' | 'lg';
 }
 
-function initialsOf(name: string): string {
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 0) return '?';
+export function initialsOf(name?: string | null): string {
+  const trimmed = (name ?? '').trim();
+  if (trimmed === '') return '?';
+  const parts = trimmed.split(/\s+/);
   if (parts.length === 1) return (parts[0]?.[0] ?? '?').toUpperCase();
   const first = parts[0]?.[0] ?? '';
   const last = parts[parts.length - 1]?.[0] ?? '';
-  return (first + last).toUpperCase();
+  return ((first + last) || '?').toUpperCase();
 }
 
 const sizeClasses = {
@@ -25,11 +27,12 @@ export const Avatar = forwardRef<HTMLDivElement, AvatarProps>(function Avatar(
   { name, size = 'md', className, ...rest },
   ref,
 ) {
+  const label = name?.trim() ? name : 'User';
   return (
     <div
       ref={ref}
       role="img"
-      aria-label={name}
+      aria-label={label}
       className={cn(
         'inline-flex shrink-0 items-center justify-center rounded-full bg-brand-100 font-semibold text-brand-800',
         sizeClasses[size],

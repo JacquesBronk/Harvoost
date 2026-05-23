@@ -8,6 +8,7 @@ import { apiFetch, ApiError } from './api-client.js';
 export interface CurrentUser {
   id: string;
   email: string;
+  // INC-002: GET /v1/auth/me returns a guaranteed non-empty display name.
   display_name: string;
   timezone: string;
   roles: Array<'admin' | 'finmgr' | 'manager' | 'employee'>;

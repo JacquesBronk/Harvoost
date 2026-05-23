@@ -12,8 +12,8 @@
  *     under a real Next.js runtime; only the API origin is intercepted.
  *
  *   - **Live (`E2E_LIVE=1`)** — drives the real Keycloak login flow:
- *       /login -> Continue with Microsoft -> Keycloak login page ->
- *       username/password -> /v1/auth/callback?code=... -> /timesheets.
+ *       /login -> [IdP sign-in button] -> Keycloak login page ->
+ *       username/password -> /auth/callback?code=... -> /timesheets.
  *     The backend validates the id_token via `jose` against the issuer
  *     discovery doc, mints the session, and sets the HttpOnly cookie.
  *     Keycloak must already be running (docker compose up -d keycloak).
@@ -67,18 +67,30 @@ async function completeKeycloakLogin(
   password: string,
 ): Promise<void> {
   // Wait for the URL to land on Keycloak. The redirect chain is:
-  //   /login -> [Continue with Microsoft] -> POST /v1/auth/oidc/login
+  //   /login -> [IdP sign-in button] -> POST /v1/auth/oidc/login
   //   -> 302 to Keycloak's /realms/<realm>/protocol/openid-connect/auth?...
   await page.waitForURL(/\/realms\/[^/]+\/protocol\/openid-connect\/auth/, {
     timeout: 15_000,
   });
-  // Keycloak's default login template uses `<input id="username">` /
-  // `<input id="password">` (no <label>). Both `getByLabel` (it has a
-  // <label for="username">) and `locator('#username')` work — we prefer
-  // `getByLabel` for accessibility-rooted selection per playbook.
-  const usernameField = page.getByLabel(/username or email|username|email/i);
+  // Keycloak 25 (PatternFly login theme) renders:
+  //   <input id="username" type="text"  ...>  (label text is "Email" because
+  //                                              the realm uses
+  //                                              registrationEmailAsUsername)
+  //   <input id="password" type="password" ...>
+  //   <button aria-label="Show password" data-password-toggle type="button">
+  //
+  // The show/hide toggle's accessible name CONTAINS "password", so a loose
+  // `getByLabel(/password/i)` matches TWO elements (input + button) and trips
+  // strict mode. We target the inputs unambiguously:
+  //   - username: the only textbox whose accessible name matches email/username
+  //   - password: by its stable `#password` id (the toggle is a <button>, not
+  //     an input, and password inputs are not reliably exposed as `textbox`
+  //     across themes — the id is the robust anchor here).
+  // Verified against the running stack's rendered DOM (oidc-flow probe):
+  // getByLabel(/password/i)=2, locator('#password')=1.
+  const usernameField = page.getByRole('textbox', { name: /email|username/i });
   await usernameField.fill(actor.email);
-  await page.getByLabel(/password/i).fill(password);
+  await page.locator('#password').fill(password);
   // Keycloak's submit is `<input type="submit" name="login" value="Sign In">`.
   await page.getByRole('button', { name: /sign in|log in/i }).click();
 }
@@ -106,7 +118,9 @@ export async function signInAs(
       );
     }
     await page.goto('/login');
-    await page.getByRole('button', { name: /continue with microsoft|sign in/i }).click();
+    // IdP-agnostic label (ADR-0001): "Continue with {display_name}" or the
+    // neutral fallback "Continue with your identity provider".
+    await page.getByRole('button', { name: /continue with .+/i }).click();
     await completeKeycloakLogin(page, actor, password);
     // Backend completes the code exchange and sets the cookie; user lands on
     // /timesheets (or wherever the original deep link wanted to go).

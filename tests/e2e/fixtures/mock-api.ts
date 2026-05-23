@@ -440,16 +440,26 @@ function routeRequest(
   }
 
   // Auth
-  if (path === '/v1/auth/oidc/login' && method === 'POST') {
+  if (path === '/v1/auth/idp-info' && method === 'GET') {
+    // Public / unauthenticated (ADR-0001 / INC-002). The login page renders
+    // `display_name` in its copy + button label. Keycloak in dev, Entra in prod.
     return {
       status: 200,
       body: {
-        // Frontend reads `authorization_url`. The real backend currently
-        // returns `authorize_url` — finding #11 area. We honour what the
-        // frontend asks for; the live-stack project surfaces the mismatch.
+        display_name: 'Keycloak (dev)',
+        issuer: 'http://localhost:8080/realms/harvoost',
+      },
+    };
+  }
+  if (path === '/v1/auth/oidc/login' && method === 'POST') {
+    return {
+      status: 201,
+      body: {
+        // Frontend reads `authorization_url`. Per the INC-002 canonical
+        // contract the backend builds the redirect_uri server-side and returns
+        // an opaque_state_id (uuid) the callback must echo back.
         authorization_url: `${process.env.E2E_WEB_BASE_URL ?? 'http://localhost:3000'}/auth/callback?code=mock-code&state=mock-state`,
-        authorize_url: `${process.env.E2E_WEB_BASE_URL ?? 'http://localhost:3000'}/auth/callback?code=mock-code&state=mock-state`,
-        state: 'mock-state',
+        opaque_state_id: '00000000-0000-4000-8000-0000000000aa',
       },
     };
   }

@@ -23,10 +23,18 @@ test.describe('Journey 1: OIDC sign-in (hermetic mock)', () => {
     await page.goto('/');
     await expect(page).toHaveURL(/\/login$/);
     await expect(page.getByRole('heading', { name: 'Sign in to Harvoost' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Continue with Microsoft' })).toBeVisible();
+    // Per ADR-0001 the button label is IdP-agnostic. With no /v1/auth/idp-info
+    // intercept installed the login page keeps the neutral fallback copy, so
+    // the label is "Continue with your identity provider". Never "Microsoft".
+    await expect(
+      page.getByRole('button', { name: /continue with .+/i }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: /continue with microsoft/i }),
+    ).toHaveCount(0);
   });
 
-  test('clicking "Continue with Microsoft" initiates the OIDC handshake', async ({
+  test('clicking the IdP sign-in button initiates the OIDC handshake', async ({
     page,
     context,
   }) => {
@@ -51,13 +59,15 @@ test.describe('Journey 1: OIDC sign-in (hermetic mock)', () => {
         contentType: 'application/json',
         body: JSON.stringify({
           authorization_url: `${url.origin.replace(':3001', ':3000')}/auth/callback?code=mock-code&state=mock-state`,
-          state: 'mock-state',
+          // Backend returns opaque_state_id (uuid); the login page persists it
+          // to sessionStorage and the callback echoes it back (OidcCallbackSchema).
+          opaque_state_id: '00000000-0000-4000-8000-000000000001',
         }),
       });
     });
 
     await page.goto('/login');
-    await page.getByRole('button', { name: 'Continue with Microsoft' }).click();
+    await page.getByRole('button', { name: /continue with .+/i }).click();
     await expect.poll(() => loginCalled).toBe(true);
   });
 
@@ -73,9 +83,33 @@ test.describe('Journey 1: OIDC sign-in (hermetic mock)', () => {
       actorKey: 'bob',
       skipPreSeedSessionCookie: true,
     });
-    // Capture the Set-Cookie header returned by the callback POST so we can
-    // assert its shape directly (HttpOnly is otherwise invisible to JS).
+    // The callback page now reads the opaque_state_id the /login leg stashed in
+    // sessionStorage and echoes it back (OidcCallbackSchema). Seed it here since
+    // this test deep-links straight to /auth/callback without the /login leg.
+    await page.addInitScript(() => {
+      try {
+        window.sessionStorage.setItem(
+          'oidc_opaque_state_id',
+          '00000000-0000-4000-8000-000000000002',
+        );
+      } catch {
+        /* sessionStorage unavailable — test will surface via redirect */
+      }
+    });
+    // Capture the Set-Cookie header AND the request body returned by the
+    // callback POST so we can assert the cookie shape and that the contract
+    // field opaque_state_id was sent.
     let setCookieHeader: string | null = null;
+    let callbackBody: unknown = null;
+    page.on('request', (req) => {
+      if (req.url().endsWith('/v1/auth/oidc/callback') && req.method() === 'POST') {
+        try {
+          callbackBody = JSON.parse(req.postData() ?? '{}');
+        } catch {
+          callbackBody = null;
+        }
+      }
+    });
     page.on('response', (resp) => {
       if (resp.url().endsWith('/v1/auth/oidc/callback') && resp.request().method() === 'POST') {
         // Playwright joins multi-Set-Cookie headers with newline.
@@ -85,6 +119,12 @@ test.describe('Journey 1: OIDC sign-in (hermetic mock)', () => {
 
     await page.goto('/auth/callback?code=mock-code&state=mock-state');
     await expect(page).toHaveURL(/\/timesheets$/);
+
+    // Contract: the callback POST body carries { code, state, opaque_state_id }.
+    expect(callbackBody, 'callback POST body captured').not.toBeNull();
+    expect((callbackBody as { opaque_state_id?: string }).opaque_state_id).toBe(
+      '00000000-0000-4000-8000-000000000002',
+    );
 
     // Set-Cookie header shape: harvoost_session=<value>; HttpOnly; SameSite=Lax; Path=/.
     expect(setCookieHeader, 'POST /v1/auth/oidc/callback response includes Set-Cookie').not.toBeNull();
@@ -116,6 +156,17 @@ test.describe('Journey 1: OIDC sign-in (hermetic mock)', () => {
     // browser auto-attaches the cookie; the web client never writes it.
     await context.clearCookies();
     await installMockApi(page, { actorKey: 'bob', skipPreSeedSessionCookie: true });
+    // Seed the opaque_state_id the callback page now requires (deep-link path).
+    await page.addInitScript(() => {
+      try {
+        window.sessionStorage.setItem(
+          'oidc_opaque_state_id',
+          '00000000-0000-4000-8000-000000000003',
+        );
+      } catch {
+        /* sessionStorage unavailable */
+      }
+    });
     await page.goto('/auth/callback?code=mock-code&state=mock-state');
     await expect(page).toHaveURL(/\/timesheets$/);
 
@@ -233,10 +284,10 @@ test.describe('Journey 1b: sign-out flow (Finding 7 + E6) — live', () => {
     expect(remaining?.value ?? '').toBe('');
 
     // Navigating to a protected route from /login goes back to /login (the
-    // route-guard in AppShell sees no session). If the user clicks
-    // "Continue with Microsoft" again it would redirect to Keycloak — we
-    // assert the /login landing is enough here; the full re-login round-trip
-    // is exercised by oidc-flow.spec.ts.
+    // route-guard in AppShell sees no session). If the user clicks the IdP
+    // sign-in button again it would redirect to Keycloak — we assert the
+    // /login landing is enough here; the full re-login round-trip is
+    // exercised by oidc-flow.spec.ts.
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/login$/);
   });

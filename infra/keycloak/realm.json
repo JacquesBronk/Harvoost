@@ -47,6 +47,7 @@
       "clientAuthenticatorType": "client-secret",
       "secret": "dev-keycloak-client-secret-not-for-prod",
       "redirectUris": [
+        "http://localhost:3000/auth/callback",
         "http://localhost:3000/v1/auth/callback",
         "http://localhost:3001/v1/auth/callback"
       ],

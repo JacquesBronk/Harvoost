@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Logger, Post, Query, Req, Res } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
 import { randomBytes } from 'node:crypto';
@@ -38,14 +38,69 @@ const SESSION_COOKIE_NAME = 'harvoost_session';
 const SESSION_TTL_MS = 12 * 3600 * 1000;
 const AUTH_PENDING_TTL_MS = 5 * 60 * 1000; // 5 min
 
+// Best-effort human-friendly name derived from an issuer URL's host, used only
+// when OIDC_DISPLAY_NAME is unset. e.g.
+//   https://login.microsoftonline.com/<tenant>/v2.0 -> "login.microsoftonline.com"
+//   http://localhost:8080/realms/harvoost            -> "localhost"
+// Returns undefined when the issuer cannot be parsed (caller falls back to the
+// literal "your identity provider").
+function deriveDisplayNameFromIssuer(issuer: string): string | undefined {
+  try {
+    const host = new URL(issuer).hostname;
+    return host || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 @Throttle({ auth: { ttl: 60_000, limit: 5 } })
 @Controller('v1/auth')
 export class AuthController {
+  private readonly logger = new Logger(AuthController.name);
+
   constructor(
     @Inject(ENV_TOKEN) private readonly env: Env,
     private readonly prisma: PrismaService,
     private readonly oidc: OidcService,
   ) {}
+
+  // PUBLIC, unauthenticated GET — must be reachable on the pre-login page so the
+  // web app can render provider-agnostic copy ("Continue with <display_name>")
+  // and surface the issuer for transparency. No auth guard, no CSRF requirement.
+  //
+  // display_name resolution (provider-agnostic, ADR-0001):
+  //   1. env.OIDC_DISPLAY_NAME (authoritative — the discovery doc has no
+  //      human-friendly name).
+  //   2. else a name derived from the discovery issuer host.
+  //   3. else the literal "your identity provider".
+  // issuer comes from the cached discovery doc; if discovery is momentarily
+  // unreachable we fall back to the configured OIDC_ISSUER_URL so the login
+  // page still renders (idp-info must NOT fail just because the IdP is down).
+  @Public()
+  @Get('idp-info')
+  async idpInfo(): Promise<{ display_name: string; issuer: string }> {
+    let issuer = this.env.OIDC_ISSUER_URL;
+    try {
+      const disc = await this.oidc.getDiscovery();
+      if (disc.issuer) {
+        issuer = disc.issuer;
+      }
+    } catch (err) {
+      // Graceful degradation: keep the configured issuer URL as the fallback.
+      this.logger.warn(
+        `idp-info: discovery unreachable, falling back to OIDC_ISSUER_URL (${
+          err instanceof Error ? err.message : String(err)
+        })`,
+      );
+    }
+
+    const displayName =
+      this.env.OIDC_DISPLAY_NAME?.trim() ||
+      deriveDisplayNameFromIssuer(issuer) ||
+      'your identity provider';
+
+    return { display_name: displayName, issuer };
+  }
 
   @Public()
   @Post('oidc/login')
@@ -270,8 +325,25 @@ export class AuthController {
     return { ok: true };
   }
 
+  // Current user. The bearer guard has already populated `user` (id, email,
+  // roles) from the session, but it does NOT carry display_name — so we load it
+  // from the users row here. display_name is NOT NULL in the schema, but we fall
+  // back to email defensively so the contract is `display_name: string` (never
+  // null/undefined); that keeps the web shell simple (it renders display_name
+  // directly without a null guard).
   @Get('me')
-  me(@CurrentUser() user: CurrentUserPayload): { id: string; email: string; roles: string[] } {
-    return { id: user.userId, email: user.email, roles: user.roles };
+  async me(
+    @CurrentUser() user: CurrentUserPayload,
+  ): Promise<{ id: string; email: string; display_name: string; roles: string[] }> {
+    const rows = await this.prisma.$queryRawUnsafe<Array<{ display_name: unknown }>>(
+      `SELECT display_name FROM users WHERE id = $1::bigint LIMIT 1`,
+      user.userId,
+    );
+    const rawDisplayName = rows[0]?.display_name;
+    const displayName =
+      typeof rawDisplayName === 'string' && rawDisplayName.trim().length > 0
+        ? rawDisplayName
+        : user.email;
+    return { id: user.userId, email: user.email, display_name: displayName, roles: user.roles };
   }
 }

@@ -42,6 +42,12 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
 
+# INC-002 / INC-001 footgun: NEXT_PUBLIC_WEB_BASE_URL is consumed in the browser
+# bundle but was never declared as a build-arg, so it fell through the webpack
+# `process` polyfill to its hardcoded fallback. Bake it like API_BASE_URL.
+ARG NEXT_PUBLIC_WEB_BASE_URL=http://localhost:3000
+ENV NEXT_PUBLIC_WEB_BASE_URL=$NEXT_PUBLIC_WEB_BASE_URL
+
 RUN pnpm --filter @harvoost/web build
 
 FROM node:${NODE_VERSION}-alpine AS runtime

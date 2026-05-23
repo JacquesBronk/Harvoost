@@ -215,6 +215,9 @@ services:
         # build arg bakes it into the client JS; env var below feeds the running
         # server (e.g. next.config headers() / CSP connect-src).
         NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+        # INC-002: bake the web base URL too so env.WEB_BASE_URL isn't a
+        # hardcoded fallback in the client bundle (closes the INC-001 footgun).
+        NEXT_PUBLIC_WEB_BASE_URL: http://localhost:3000
     image: harvoost-web:dev
     container_name: harvoost-web
     env_file: .env

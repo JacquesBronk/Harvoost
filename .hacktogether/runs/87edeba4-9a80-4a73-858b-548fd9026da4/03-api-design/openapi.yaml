@@ -140,6 +140,33 @@ paths:
   # ============================================================
   # AUTH
   # ============================================================
+  /v1/auth/idp-info:
+    get:
+      tags: [Auth]
+      summary: Public IdP display metadata for the login page
+      description: |
+        Unauthenticated. Returns the human-friendly identity-provider name and
+        the OIDC issuer so the pre-login page can render provider-agnostic copy
+        (per ADR-0001) without baking the provider name into the web bundle.
+        `display_name` is sourced from the server's `OIDC_DISPLAY_NAME` env var
+        (the OIDC discovery doc carries no human-friendly name); when unset it
+        is derived from the issuer host, finally falling back to the literal
+        "your identity provider". `issuer` is read from the cached discovery
+        doc, falling back to the configured issuer URL if discovery is briefly
+        unreachable (this endpoint never fails just because the IdP is down).
+      operationId: getIdpInfo
+      security: []
+      responses:
+        '200':
+          description: IdP display metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdpInfoResponse'
+              example:
+                display_name: Keycloak
+                issuer: http://localhost:8080/realms/harvoost
+
   /v1/auth/oidc/login:
     post:
       tags: [Auth]
@@ -2554,6 +2581,18 @@ components:
       required: [page, page_size, total_count]
 
     # ---------- Auth ----------
+    IdpInfoResponse:
+      type: object
+      properties:
+        display_name:
+          type: string
+          description: Human-friendly identity-provider name for login-page copy (e.g. "Keycloak", "Microsoft Entra ID").
+        issuer:
+          type: string
+          format: uri
+          description: The OIDC issuer URL, from the discovery doc (or the configured issuer URL if discovery is unreachable).
+      required: [display_name, issuer]
+
     OidcLoginRequest:
       type: object
       properties:
