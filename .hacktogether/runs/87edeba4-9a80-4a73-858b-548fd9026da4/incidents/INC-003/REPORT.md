@@ -45,3 +45,15 @@ Dispatch `debugger` to reproduce the loop in a real browser (Playwright `chromiu
 ## HITL gates
 - **(a)** After the debugger confirms root cause, before dispatching the fix.
 - **(b)** Before pushing the commit. Commit + push to main (closes #3) only after gate (b).
+
+## Resolution — status: CLOSED (2026-05-23, commit 1c68fee, closes #3)
+Root cause CONFIRMED (not revised) by live Playwright `chromium-live`: a single real Keycloak Alice session fired **909 `GET /v1/auth/me` in 11.4s — 4× 200 then 905× 429**, page wedged on "Loading Harvoost"/bouncing to `/login`. Two compounding defects, both fixed:
+
+1. **Backend (trigger):** class-level `@Throttle({ auth: 5/60s })` at `auth.controller.ts:56` covered `@Get('me')` (line 334), so the benign per-page-load `/me` read shared the brute-force bucket with `oidc/login` + `oidc/callback` (login+callback burn 2 of 5 on every sign-in → 5th `/me` 429s). Fixed: `@SkipThrottle({ auth: true })` on `me()` → falls back to global 300/60s. `oidc/login` + `oidc/callback` keep 5/60s (brute-force protection unchanged). +4 backend regression tests.
+2. **Frontend (amplifier):** `useCurrentUser` mapped only 401/403 → `null` and re-threw 429/5xx/network with `retry:false` → `page.tsx`/`AppShell`/guards read undefined as logged-out → `router.replace('/login')` → remount → refetch → ~900-request storm. Fixed: 429/5xx/network are transient (`data` stays `undefined`, never `null`); redirect ONLY on `data === null` via a centralized `resolveAuthGate` helper; capped exponential backoff honoring the `Retry-After-auth` header (`ApiError.retryAfterMs`). +20 frontend tests.
+
+**Verification:** `pnpm test` 428 pass + 1 known pre-existing `RbacScopeService` fail (= baseline 404 + 24 new). Clean `docker compose up -d --build api web`. Live Playwright `chromium-live` 2/2 — Criterion 1: signed-in Alice navigated 4 pages + 5 hard-refreshes → 10 `/me` requests, all 200, zero 429, no `/login` bounce; Criterion 2: forced 429 (`Retry-After-auth:2`) → 4 `/me` requests (bounded backoff, no storm), no `/login` bounce, recovered once `/me` returned 200. New canonical regression spec `tests/e2e/specs/auth-me-throttle.spec.ts`.
+
+**Scope honored:** real-Entra-in-prod OIDC path untouched (fail-closed, v0.2.0); login/callback throttle not weakened; `.github/` left untracked (needs `workflow` OAuth scope, as in INC-001/INC-002); #4 (reporting-endpoint mismatches) and #5 (timesheets timer) NOT touched. Out-of-scope observation logged: rapid hard-refresh can 429 the separate `/v1/time-entries` data fetch on the global bucket — that is #4 territory, not `/me`/the auth gate.
+
+**Follow-ups (NOT done — deferred):** the separate `/v1/time-entries` global-bucket 429 under aggressive refresh belongs to #4; consider a dedicated read bucket or client-side dedupe there. The 2 pre-existing `csrf.spec.ts` hermetic-e2e failures (Finding-8 CSRF middleware) remain — unrelated to #3, tracked under the v0.2.0 "~45 selector mismatches" item.

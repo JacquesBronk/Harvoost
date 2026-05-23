@@ -14,7 +14,23 @@ function makePrismaStub(opts: { override?: { scope: string; user_id?: string; pr
         throw Object.assign(new Error('conflicting key value violates exclusion constraint "so_no_overlap"'), { code: '23P01' });
       }
       if (sql.includes('INSERT INTO schedule_overrides')) {
-        return [{ id: 42 }];
+        return [
+          {
+            id: 42,
+            scope: 'user',
+            user_id: null,
+            project_id: null,
+            effective_from: '2026-06-01',
+            effective_to: '2026-06-30',
+            start_time: '09:00:00',
+            end_time: '18:00:00',
+            lunch_start_time: null,
+            lunch_end_time: null,
+            reason: 'Cover for vacation period',
+            created_by: 10,
+            created_at: '2026-05-23T00:00:00.000Z',
+          },
+        ];
       }
       return [];
     }),
@@ -46,12 +62,15 @@ function makeAuditStub() {
   return { record: vi.fn(async () => undefined) };
 }
 
+// INC-004 Row 6: the create-override body now follows the spec shape
+// (effective_from/effective_to/start_time/end_time/user_id/project_id).
 const baseBody = {
   scope: 'user' as const,
-  target_id: '20',
-  date_range: { start: '2026-06-01', end: '2026-06-30' },
-  new_start: '09:00',
-  new_end: '18:00',
+  user_id: '20',
+  effective_from: '2026-06-01',
+  effective_to: '2026-06-30',
+  start_time: '09:00',
+  end_time: '18:00',
   reason: 'Cover for vacation period',
 };
 
@@ -74,7 +93,10 @@ describe('SchedulesController createOverride — RBAC + validation', () => {
       { userId: '10', email: 'm@x', roles: ['manager'] },
       baseBody,
     );
-    expect(res).toEqual({ id: '42', scope: 'user' });
+    expect(res.id).toBe('42');
+    expect(res.scope).toBe('user');
+    expect(res.effective_from).toBe('2026-06-01');
+    expect(res.start_time).toBe('09:00');
     expect(rbac.assertCanSeeUser).toHaveBeenCalledWith('10', '20');
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'schedule.override_create' }),
@@ -96,24 +118,27 @@ describe('SchedulesController createOverride — RBAC + validation', () => {
     ).rejects.toBeInstanceOf(RbacForbiddenError);
   });
 
-  it('scope=project: admin allowed', async () => {
+  it('scope=project: admin allowed (maps project_id, not user_id)', async () => {
+    // user_id must be dropped from the user-shaped baseBody for project scope.
+    const { user_id: _omit, ...rest } = baseBody;
     const res = await ctrl.createOverride(
       { userId: '1', email: 'a@x', roles: ['admin'] },
-      { ...baseBody, scope: 'project', target_id: '5' },
+      { ...rest, scope: 'project', project_id: '5' },
     );
-    expect(res).toEqual({ id: '42', scope: 'project' });
+    expect(res.id).toBe('42');
   });
 
   it('scope=project: manager rejected (admin/finmgr only)', async () => {
+    const { user_id: _omit, ...rest } = baseBody;
     await expect(
       ctrl.createOverride(
         { userId: '10', email: 'm@x', roles: ['manager'] },
-        { ...baseBody, scope: 'project', target_id: '5' },
+        { ...rest, scope: 'project', project_id: '5' },
       ),
     ).rejects.toBeInstanceOf(RbacForbiddenError);
   });
 
-  it('scope=org: target_id must be omitted', async () => {
+  it('scope=org: user_id/project_id must be omitted', async () => {
     await expect(
       ctrl.createOverride(
         { userId: '1', email: 'a@x', roles: ['admin'] },
@@ -125,16 +150,16 @@ describe('SchedulesController createOverride — RBAC + validation', () => {
   it('scope=org: admin can create org-wide override', async () => {
     const res = await ctrl.createOverride(
       { userId: '1', email: 'a@x', roles: ['admin'] },
-      { scope: 'org', date_range: { start: '2026-07-01', end: '2026-07-31' }, new_start: '09:00', new_end: '17:00', reason: 'July policy' },
+      { scope: 'org', effective_from: '2026-07-01', effective_to: '2026-07-31', start_time: '09:00', end_time: '17:00', reason: 'July policy' },
     );
-    expect(res).toEqual({ id: '42', scope: 'org' });
+    expect(res.id).toBe('42');
   });
 
   it('rejects malformed time strings', async () => {
     await expect(
       ctrl.createOverride(
         { userId: '1', email: 'a@x', roles: ['admin'] },
-        { ...baseBody, scope: 'org', target_id: undefined, new_start: '25:00' },
+        { scope: 'org', effective_from: '2026-07-01', effective_to: '2026-07-31', start_time: '25:00', end_time: '17:00', reason: 'July policy' },
       ),
     ).rejects.toThrow();
   });

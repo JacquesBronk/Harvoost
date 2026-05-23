@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import { Roles } from '../common/roles.decorator';
 import { CurrentUser, type CurrentUserPayload } from '../common/current-user.decorator';
@@ -152,6 +152,149 @@ export class ProjectsController {
       entityType: 'project',
       entityId: id,
       after: { manager_id: body.manager_id },
+    });
+    return { ok: true };
+  }
+
+  // GET /v1/projects/{id}/members → OffsetPaginated<ProjectMember>.
+  // Lists CURRENTLY-active members (left_at IS NULL) — mirrors the partial
+  // unique index the POST relies on. JOINs users for display_name/email so the
+  // admin UI can render names without a second round-trip. Admin-only.
+  @Roles('admin')
+  @Get(':id/members')
+  async listMembers(
+    @Param('id') id: string,
+    @Query('page') page = '1',
+    @Query('page_size') pageSize = '50',
+  ) {
+    const p = Math.max(parseInt(page, 10) || 1, 1);
+    const ps = Math.min(Math.max(parseInt(pageSize, 10) || 50, 1), 200);
+    const offset = (p - 1) * ps;
+    const totalRows = await this.prisma.$queryRawUnsafe<Array<{ n: unknown }>>(
+      `SELECT COUNT(*)::int AS n FROM project_members WHERE project_id = $1::bigint AND left_at IS NULL`,
+      id,
+    );
+    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
+      `SELECT pm.id, pm.project_id, pm.user_id,
+              u.display_name AS user_display_name, u.email AS user_email,
+              pm.joined_at, pm.left_at
+       FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $1::bigint AND pm.left_at IS NULL
+       ORDER BY u.display_name ASC, pm.id ASC
+       LIMIT $2::int OFFSET $3::int`,
+      id,
+      ps,
+      offset,
+    );
+    return {
+      data: rows.map((r) => ({
+        id: String(r.id),
+        project_id: String(r.project_id),
+        user_id: String(r.user_id),
+        user_display_name: r.user_display_name ?? undefined,
+        user_email: r.user_email ?? undefined,
+        joined_at: r.joined_at,
+        left_at: r.left_at ?? null,
+      })),
+      page: p,
+      page_size: ps,
+      total_count: Number(totalRows[0]?.n ?? 0),
+    };
+  }
+
+  // DELETE /v1/projects/{id}/members/{userId} → soft-removes the active
+  // membership (left_at = CURRENT_DATE). Soft-delete keeps the audit/history
+  // trail AND frees the partial unique index so the same user can be re-added
+  // later via POST. Admin-only. Idempotent: no-op if already removed/absent.
+  @Roles('admin')
+  @Delete(':id/members/:userId')
+  async removeMember(
+    @CurrentUser() actor: CurrentUserPayload,
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+  ) {
+    await this.prisma.$executeRawUnsafe(
+      `UPDATE project_members SET left_at = CURRENT_DATE
+       WHERE project_id = $1::bigint AND user_id = $2::bigint AND left_at IS NULL`,
+      id,
+      userId,
+    );
+    await this.audit.record({
+      actorId: actor.userId,
+      action: 'project.member_remove',
+      entityType: 'project',
+      entityId: id,
+      after: { user_id: userId },
+    });
+    return { ok: true };
+  }
+
+  // GET /v1/projects/{id}/managers → OffsetPaginated<ProjectManagerAnchor>.
+  // JOINs users for display_name/email. Admin-only.
+  @Roles('admin')
+  @Get(':id/managers')
+  async listManagers(
+    @Param('id') id: string,
+    @Query('page') page = '1',
+    @Query('page_size') pageSize = '50',
+  ) {
+    const p = Math.max(parseInt(page, 10) || 1, 1);
+    const ps = Math.min(Math.max(parseInt(pageSize, 10) || 50, 1), 200);
+    const offset = (p - 1) * ps;
+    const totalRows = await this.prisma.$queryRawUnsafe<Array<{ n: unknown }>>(
+      `SELECT COUNT(*)::int AS n FROM project_managers WHERE project_id = $1::bigint`,
+      id,
+    );
+    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
+      `SELECT pmgr.id, pmgr.project_id, pmgr.manager_id,
+              u.display_name AS manager_display_name, u.email AS manager_email,
+              pmgr.assigned_at
+       FROM project_managers pmgr
+       JOIN users u ON u.id = pmgr.manager_id
+       WHERE pmgr.project_id = $1::bigint
+       ORDER BY u.display_name ASC, pmgr.id ASC
+       LIMIT $2::int OFFSET $3::int`,
+      id,
+      ps,
+      offset,
+    );
+    return {
+      data: rows.map((r) => ({
+        id: String(r.id),
+        project_id: String(r.project_id),
+        manager_id: String(r.manager_id),
+        manager_display_name: r.manager_display_name ?? undefined,
+        manager_email: r.manager_email ?? undefined,
+        assigned_at: r.assigned_at,
+      })),
+      page: p,
+      page_size: ps,
+      total_count: Number(totalRows[0]?.n ?? 0),
+    };
+  }
+
+  // DELETE /v1/projects/{id}/managers/{managerId} → unanchors a manager.
+  // Hard delete (project_managers has no soft-delete column; the unique
+  // constraint is on the full row). Admin-only. Idempotent.
+  @Roles('admin')
+  @Delete(':id/managers/:managerId')
+  async removeManager(
+    @CurrentUser() actor: CurrentUserPayload,
+    @Param('id') id: string,
+    @Param('managerId') managerId: string,
+  ) {
+    await this.prisma.$executeRawUnsafe(
+      `DELETE FROM project_managers WHERE project_id = $1::bigint AND manager_id = $2::bigint`,
+      id,
+      managerId,
+    );
+    await this.audit.record({
+      actorId: actor.userId,
+      action: 'project.manager_remove',
+      entityType: 'project',
+      entityId: id,
+      after: { manager_id: managerId },
     });
     return { ok: true };
   }

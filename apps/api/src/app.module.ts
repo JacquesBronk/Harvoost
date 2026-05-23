@@ -21,6 +21,8 @@ import { LeaveModule } from './leave/leave.module';
 import { ApprovalsModule } from './approvals/approvals.module';
 import { ExceptionsModule } from './exceptions/exceptions.module';
 import { ReportsModule } from './reports/reports.module';
+import { CostRatesModule } from './cost-rates/cost-rates.module';
+import { BillableRatesModule } from './billable-rates/billable-rates.module';
 import { ExportsModule } from './exports/exports.module';
 import { AuditLogModule } from './audit-log/audit-log.module';
 import { ChatbotModule } from './chatbot/chatbot.module';
@@ -52,6 +54,8 @@ import { SyncModule } from './sync/sync.module';
     ApprovalsModule,
     ExceptionsModule,
     ReportsModule,
+    CostRatesModule,
+    BillableRatesModule,
     ExportsModule,
     AuditLogModule,
     ChatbotModule,

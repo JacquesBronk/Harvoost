@@ -91,9 +91,10 @@ describe('teamDashboard — RBAC scoping + shape', () => {
       rbac as any,
     );
     const out = await ctrl.teamDashboard(actor, '2026-05-01/2026-05-31');
-    expect(out.data).toHaveLength(2);
-    expect(out.data[0].display_name).toBe('Alice');
-    expect(out.data[1].display_name).toBe('Bob');
+    // INC-004 Row 1: envelope key is `items` (was `data`).
+    expect(out.items).toHaveLength(2);
+    expect(out.items[0].display_name).toBe('Alice');
+    expect(out.items[1].display_name).toBe('Bob');
     expect(out.scope_meta.visible_users).toBe(2);
     expect(rbac.getVisibleUserIds).toHaveBeenCalledWith('1');
   });
@@ -121,12 +122,19 @@ describe('profitability — admin/finmgr only', () => {
       rbac as any,
     );
     const out = await ctrl.profitability('2026-05-01/2026-05-31');
-    expect(out.data).toHaveLength(2);
+    // INC-004 Row 2: envelope key is `items`; row fields are `project_name`/`hours`.
+    expect(out.items).toHaveLength(2);
     // Lowest margin_pct first (B has 6.25% margin; A has 75% margin)
-    expect(out.data[0].project_id).toBe('2');
-    expect(out.data[1].project_id).toBe('1');
-    expect(out.data[0].margin).toBe(100); // 1600 - 1500
-    expect(out.data[1].margin).toBe(1500); // 2000 - 500
+    expect(out.items[0].project_id).toBe('2');
+    expect(out.items[1].project_id).toBe('1');
+    expect(out.items[0].margin).toBe(100); // 1600 - 1500
+    expect(out.items[1].margin).toBe(1500); // 2000 - 500
+    // Field renames: project_name (was name), hours (was hours_total).
+    expect(out.items[0].project_name).toBe('B');
+    expect(out.items[1].project_name).toBe('A');
+    expect(out.items[0]).toHaveProperty('hours');
+    expect(out.items[0]).not.toHaveProperty('name');
+    expect(out.items[0]).not.toHaveProperty('hours_total');
   });
 
   it('treats fixed_fee billing mode as one-time revenue, not per-entry', async () => {
@@ -145,8 +153,8 @@ describe('profitability — admin/finmgr only', () => {
     );
     const out = await ctrl.profitability('2026-05-01/2026-05-31');
     // Revenue = fixed_fee_amount, NOT the (incorrect) hourly_revenue value.
-    expect(out.data[0].revenue).toBe(10000);
-    expect(out.data[0].margin).toBe(7500);
+    expect(out.items[0].revenue).toBe(10000);
+    expect(out.items[0].margin).toBe(7500);
   });
 });
 

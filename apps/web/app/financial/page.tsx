@@ -15,11 +15,16 @@ import {
   useToast,
 } from '@harvoost/ui';
 import { useRouter } from 'next/navigation';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { PageHeader } from '@/components/PageHeader.js';
 import { ErrorBlock } from '@/components/ErrorBlock.js';
 import { apiFetch } from '@/lib/api-client.js';
-import { formatHours } from '@/lib/tz.js';
+import {
+  currentMonthRange,
+  dateRangeParam,
+  formatHours,
+  viewerTimeZone,
+} from '@/lib/tz.js';
 import { useScope } from '@/lib/rbac.js';
 import type { FinancialProjectRow, Paginated } from '@/lib/api-types.js';
 
@@ -49,13 +54,21 @@ export default function FinancialPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.isLoading, scope.user, scope.canSeeFinancialData]);
 
+  // INC-004: the profitability endpoint requires an inclusive local-date
+  // `date_range=YYYY-MM-DD/YYYY-MM-DD`. Default to the current calendar month
+  // (first-of-month → today) in the viewer's zone.
+  const dateRange = useMemo(() => {
+    const { from, to } = currentMonthRange(viewerTimeZone());
+    return dateRangeParam(from, to);
+  }, []);
+
   const profitability = useQuery({
-    queryKey: ['financial', 'projects'],
+    queryKey: ['financial', 'projects', dateRange],
     queryFn: () =>
       apiFetch<Paginated<FinancialProjectRow>>('/v1/reports/profitability', {
-        query: { group_by: 'project', limit: 100 },
+        query: { date_range: dateRange },
       }),
-    enabled: scope.canSeeFinancialData,
+    enabled: scope.canSeeFinancialData && !!dateRange,
   });
 
   const rows = profitability.data?.items ?? [];

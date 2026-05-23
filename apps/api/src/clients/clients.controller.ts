@@ -1,10 +1,11 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import { Roles } from '../common/roles.decorator';
 import { PrismaService } from '../prisma/prisma.service';
 import { ZodValidationPipe } from '../common/dto/zod-validation.pipe';
 import { CurrentUser, type CurrentUserPayload } from '../common/current-user.decorator';
 import { AuditService } from '../common/audit/audit.service';
+import { ValidationFailedError } from '@harvoost/shared';
 
 const CreateClientSchema = z.object({ name: z.string().min(1).max(200) });
 
@@ -76,6 +77,42 @@ export class ClientsController {
       entityType: 'client',
       entityId: id,
       after,
+    });
+    return { ok: true };
+  }
+
+  // DELETE /v1/clients/{id} → hard delete.
+  // FK-GUARD: projects.client_id REFERENCES clients(id) ON DELETE RESTRICT, so
+  // deleting a client that still has projects raises Postgres 23503
+  // (foreign_key_violation). Map that to a clean domain error instead of a raw
+  // 500 — mirrors the 23P01 → ValidationFailedError pattern in
+  // billable-rates.controller.ts. Admin-only per INC-004 scope (deletion is a
+  // narrower grant than the create/update FinMgr can perform — do NOT widen).
+  // Audit on success only.
+  @Roles('admin')
+  @Delete(':id')
+  async remove(@CurrentUser() actor: CurrentUserPayload, @Param('id') id: string) {
+    try {
+      await this.prisma.$executeRawUnsafe(
+        `DELETE FROM clients WHERE id = $1::bigint`,
+        id,
+      );
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      const message = err instanceof Error ? err.message : String(err);
+      if (code === '23503' || /foreign key|23503/i.test(message)) {
+        throw new ValidationFailedError(
+          'Cannot delete a client that still has projects. Reassign or archive its projects first.',
+          { code: 'CLIENT_HAS_PROJECTS' },
+        );
+      }
+      throw err;
+    }
+    await this.audit.record({
+      actorId: actor.userId,
+      action: 'client.delete',
+      entityType: 'client',
+      entityId: id,
     });
     return { ok: true };
   }

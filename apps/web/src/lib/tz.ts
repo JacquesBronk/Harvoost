@@ -81,3 +81,31 @@ export function tzBadgeLabel(viewerZone: string, entryZone: string | null | unde
 export function todayLocalDate(zone: string = viewerTimeZone()): string {
   return DateTime.now().setZone(zone).toISODate() ?? '';
 }
+
+/**
+ * INC-004: build the `date_range=YYYY-MM-DD/YYYY-MM-DD` query value the reports
+ * endpoints (team-dashboard, profitability) read. Both bounds are inclusive
+ * local dates already in `YYYY-MM-DD` form. Returns `''` if either bound is
+ * empty so the caller can keep the query disabled.
+ */
+export function dateRangeParam(fromDate: string, toDate: string): string {
+  if (!fromDate || !toDate) return '';
+  return `${fromDate}/${toDate}`;
+}
+
+/**
+ * INC-004: the current calendar month as an inclusive local-date range
+ * (first-of-month → today). The profitability dashboard defaults to this when
+ * the user has not picked an explicit range. `to` is clamped to today so we
+ * never query into the future; if today is before the first of the month (it
+ * never is) it still falls back to the month start.
+ */
+export function currentMonthRange(zone: string = viewerTimeZone()): {
+  from: string;
+  to: string;
+} {
+  const now = DateTime.now().setZone(zone);
+  const from = now.startOf('month').toISODate() ?? '';
+  const to = now.toISODate() ?? from;
+  return { from, to: to < from ? from : to };
+}

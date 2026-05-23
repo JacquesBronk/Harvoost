@@ -221,8 +221,11 @@ export class ReportsController {
       };
     }
 
+    // Envelope key is `items` to match the FE `ScopedList<T>` convention
+    // (INC-004 Row 1). team-dashboard carries HOURS only — no cost columns —
+    // so there is no cost-stripping concern here.
     return {
-      data: userHours.map((r) => {
+      items: userHours.map((r) => {
         const uid = String(r.user_id);
         const exc = exceptionsByUser[uid] ?? { missed_punch_count: 0, overtime_count: 0 };
         return {
@@ -345,14 +348,16 @@ export class ReportsController {
       const breakdown = modeByProject[pid] ?? [];
       return {
         project_id: pid,
-        name: String(r.project_name),
+        // INC-004 Row 2: field names aligned to the FE `FinancialProjectRow`
+        // type (`project_name`, `hours`). Cost/revenue/margin unchanged.
+        project_name: String(r.project_name),
         billing_mode: billingMode,
         currency: String(r.currency),
         revenue: Number(revenue.toFixed(2)),
         cost: Number(cost.toFixed(2)),
         margin: Number(margin.toFixed(2)),
         margin_pct: Number(marginPct.toFixed(2)),
-        hours_total: Number(r.total_hours ?? 0),
+        hours: Number(r.total_hours ?? 0),
         billable_hours: Number(r.billable_hours ?? 0),
         billing_mode_breakdown: breakdown.length > 1 ? breakdown : null,
       };
@@ -366,7 +371,10 @@ export class ReportsController {
       return a.margin_pct - b.margin_pct;
     });
 
-    return { data, date_range: { from, to } };
+    // Envelope key is `items` to match the FE `Paginated<FinancialProjectRow>`
+    // read (INC-004 Row 2). RBAC stays @Roles('admin','finmgr') — cost/margin
+    // are financial-only.
+    return { items: data, date_range: { from, to } };
   }
 
   // GET /v1/reports/employees/:userId/rollup?date_range=...

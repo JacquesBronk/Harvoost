@@ -133,16 +133,14 @@ describe('OpenAPI contract — every documented operation has a registered route
       // Schedule override sub-resource (GET-by-id + PATCH) deferred — list/create/delete are implemented.
       'GET /v1/schedules/overrides/{override_id}',
       'PATCH /v1/schedules/overrides/{override_id}',
-      'GET /v1/schedules/dashboard',
+      // GET /v1/schedules/dashboard implemented in INC-004 (#4) — removed from pending.
       // Project sub-resources stubbed.
       'GET /v1/projects/{project_id}/tasks',
       'POST /v1/projects/{project_id}/tasks',
       'GET /v1/projects/{project_id}/tasks/{task_id}',
       'PATCH /v1/projects/{project_id}/tasks/{task_id}',
-      'GET /v1/projects/{project_id}/members',
-      'DELETE /v1/projects/{project_id}/members/{user_id}',
-      'GET /v1/projects/{project_id}/managers',
-      'DELETE /v1/projects/{project_id}/managers/{user_id}',
+      // INC-004 expansion: members/managers list + delete now implemented
+      // (projects.controller.ts) — removed from pending.
       // Detail-by-id endpoints not yet implemented.
       'GET /v1/clients/{client_id}',
       'GET /v1/leave/requests/{request_id}',
@@ -164,18 +162,21 @@ describe('OpenAPI contract — every documented operation has a registered route
     expect(filtered).toEqual([]);
   });
 
-  it('the frontend-invented endpoints (NOT in openapi.yaml) are flagged as integration gaps', () => {
-    const inventedPaths = [
-      '/v1/reports/team-dashboard',
-      '/v1/reports/profitability',
-      '/v1/reports/employees/',
-      '/v1/reports/projects/',
-    ];
-    for (const inv of inventedPaths) {
+  it('INC-004 (#4) closed the team-dashboard + profitability drift — both are now in the contract', () => {
+    // These two were "frontend-invented" gaps at v0.1.0. INC-004 reconciled them:
+    // the routes are implemented (covered by the test above) AND added to openapi.yaml.
+    for (const inv of ['/v1/reports/team-dashboard', '/v1/reports/profitability']) {
       const inSpec = yaml.includes(`${inv}:`) || yaml.includes(`${inv}/`);
-      // These were called out in the frontend HANDOFF as endpoints that need
-      // confirmation. We assert they're NOT in the contract so any future
-      // implementation has to add them deliberately.
+      expect(inSpec, `Endpoint ${inv} should be in openapi.yaml after INC-004`).toBe(true);
+    }
+  });
+
+  it('the report rollup drill-ins remain documented gaps (deferred — separate follow-up)', () => {
+    // Still unreconciled (api-designer KNOWN_SPEC_GAP): the per-employee / per-project
+    // rollup drill-ins are out of INC-004 scope. Assert they stay deliberately absent so a
+    // future implementation has to add them on purpose (same guard as the original test).
+    for (const inv of ['/v1/reports/employees/', '/v1/reports/projects/']) {
+      const inSpec = yaml.includes(`${inv}:`) || yaml.includes(`${inv}/`);
       expect(inSpec, `Endpoint ${inv} unexpectedly present in openapi.yaml`).toBe(false);
     }
   });

@@ -22,7 +22,7 @@ info:
     ## Pagination
     - **Cursor-based** for high-volume / append-mostly resources: time_entries, audit_log,
       exceptions, chatbot_conversations, chatbot_messages, leave_requests.
-    - **Offset-based** for catalog-style resources: users, projects, clients.
+    - **Offset-based** for catalog-style resources: users, projects, clients, cost_rates, billable_rates.
 
     ## Idempotency
     `Idempotency-Key` header is REQUIRED on `POST /v1/time-entries/start`, `/stop`, and
@@ -42,7 +42,10 @@ info:
     ## Cost-column stripping
     For `POST /v1/reports/*` and `POST /v1/exports/excel`, the response schema for Manager
     and Employee callers omits `cost_rate`, `cost_amount`, and the aggregate `margin_*` fields.
-    The behavior is described in each operation's description.
+    The behavior is described in each operation's description. The hours-only
+    `GET /v1/reports/team-dashboard` carries no financial fields at all; the financial
+    `GET /v1/reports/profitability` is Admin/FinMgr-only (no stripped variant — Manager/Employee
+    get 403).
 
     ## Rate limits
     Chatbot endpoints and `POST /v1/exports/*` return `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
@@ -89,6 +92,8 @@ tags:
     description: Missed punches, overtime, anomalies — detection and resolution.
   - name: Reports
     description: Detailed activity and rolled-up time reports; RBAC-scoped; cost columns stripped for non-financial roles.
+  - name: Rates
+    description: Effective-dated employee cost rates and project/task billable rates (Admin/FinMgr only — financial data).
   - name: Exports
     description: Harvest-compatible Excel export; sync (<=100k rows) or async (>100k rows).
   - name: Chatbot
@@ -516,14 +521,31 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
       tags: [Clients]
-      summary: Archive client (Admin/FinMgr only; soft delete)
+      summary: Delete client (Admin/FinMgr only)
+      description: |
+        Admin/FinMgr only. Deletes the client. The client must not still be referenced by
+        any project: the `clients ← projects.client_id` foreign key is `ON DELETE RESTRICT`,
+        so the backend catches the FK violation and maps it to a clean `409 VALIDATION_FAILED`
+        domain error (rather than leaking the raw DB error). Reassign or remove the dependent
+        projects first, then retry the delete.
       operationId: deleteClient
       responses:
         '204':
-          description: Client archived.
+          description: Client deleted.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Client is still referenced by one or more projects (FK guard).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: VALIDATION_FAILED
+                message: Cannot delete client 7 — it is still referenced by 3 project(s). Reassign or remove them first.
+                details:
+                  client_id: 7
+                  referencing_projects: 3
 
   # ============================================================
   # PROJECTS
@@ -663,6 +685,53 @@ paths:
   /v1/projects/{project_id}/members:
     parameters:
       - $ref: '#/components/parameters/ProjectIdPath'
+    get:
+      tags: [Projects]
+      summary: List members of a project (Admin only)
+      description: |
+        Admin-only. Lists the project's members with offset pagination. The caller must hold
+        the `admin` role; other roles receive 403 `RBAC_FORBIDDEN`. Each row carries the
+        optional `user_display_name`/`user_email` projections the admin members table renders.
+      operationId: listProjectMembers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated project members.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ProjectMember' }
+                    required: [data]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 2
+                data:
+                  - id: 301
+                    project_id: 42
+                    user_id: 18
+                    user_display_name: Bob Example
+                    user_email: bob@harvoost.example.com
+                    joined_at: 2026-05-22
+                    left_at: null
+                  - id: 302
+                    project_id: 42
+                    user_id: 19
+                    user_display_name: Carol Example
+                    user_email: carol@harvoost.example.com
+                    joined_at: 2026-05-20
+                    left_at: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [Projects]
       summary: Add a member to a project (Admin only)
@@ -704,6 +773,46 @@ paths:
   /v1/projects/{project_id}/managers:
     parameters:
       - $ref: '#/components/parameters/ProjectIdPath'
+    get:
+      tags: [Projects]
+      summary: List managers anchored to a project (Admin only)
+      description: |
+        Admin-only. Lists the manager anchors for this project with offset pagination. The
+        caller must hold the `admin` role; other roles receive 403 `RBAC_FORBIDDEN`. Each row
+        carries the optional `manager_display_name`/`manager_email` projections the admin
+        managers table renders.
+      operationId: listProjectManagers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated project manager anchors.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ProjectManagerAnchor' }
+                    required: [data]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 1
+                data:
+                  - id: 401
+                    project_id: 42
+                    manager_id: 17
+                    manager_display_name: Alice Example
+                    manager_email: alice@harvoost.example.com
+                    assigned_at: 2026-05-01T08:00:00+00:00
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [Projects]
       summary: Anchor a manager to this project (Admin only)
@@ -1410,6 +1519,13 @@ paths:
         Manager may create only `scope=user` overrides for users in their RBAC scope.
         Admin and FinMgr may create user/project/org overrides. Overlapping overrides
         for the same scope+target return 409.
+
+        **Request shape (authoritative — INC-004):** the body uses
+        `effective_from`/`effective_to` (dates), `start_time`/`end_time` (HH:MM),
+        optional `lunch_start_time`/`lunch_end_time`, `user_id` (scope=user),
+        `project_id` (scope=project), and an optional `reason`. The backend Zod
+        schema is aligned TO this shape; do not reintroduce the legacy
+        `date_range`/`new_start`/`target_id` form.
       operationId: createScheduleOverride
       requestBody:
         required: true
@@ -1423,6 +1539,8 @@ paths:
               effective_to: 2026-06-30
               start_time: '09:00'
               end_time: '18:00'
+              lunch_start_time: '12:30'
+              lunch_end_time: '13:00'
               reason: Support rotation
       responses:
         '201':
@@ -1948,6 +2066,347 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
 
+  /v1/reports/team-dashboard:
+    get:
+      tags: [Reports]
+      summary: Team dashboard (manager-scoped hours-only rollup; no cost columns)
+      description: |
+        Returns one row per visible user with their hours summary for the requested date range.
+        Powers the `/dashboard` team view.
+
+        **Date range:** the single required `date_range` query parameter takes the form
+        `YYYY-MM-DD/YYYY-MM-DD` (inclusive local dates). This replaces the off-spec
+        `start_at_from`/`start_at_to` ISO-timestamp pair the web client used before INC-004;
+        the frontend now builds `date_range` from its local-date range.
+
+        **RBAC (manager-scoped):** the result is intersected with the requester's RBAC cascade
+        scope (`getVisibleUserIds` / `getVisibleProjectIds`); `scope_meta` reflects the visible
+        counts so the client can render an empty state. Available to Manager, FinMgr, and Admin;
+        Employees (own-data only) do not reach the team view.
+
+        **Hours-only:** this report carries `total_hours` (plus optional billable / non-billable
+        splits) and operational counts ONLY. It deliberately exposes NO cost, billable-rate, or
+        margin columns — there is no cost-stripping branch because no financial field is ever
+        present in any caller's response.
+
+        **Response envelope:** `{ items, scope_meta }` (the `items` key matches the
+        `ScopedList<T>` convention the web client reads — NOT `data`).
+      operationId: getTeamDashboard
+      parameters:
+        - $ref: '#/components/parameters/DateRange'
+      responses:
+        '200':
+          description: Team dashboard rows + scope_meta.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/TeamDashboardRow' }
+                  scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                required: [items, scope_meta]
+              example:
+                items:
+                  - user_id: 18
+                    display_name: Bob Example
+                    total_hours: 38.5
+                    billable_hours: 32
+                    non_billable_hours: 6.5
+                    hours_by_project:
+                      - project_id: 42
+                        project_name: Atlas
+                        hours: 24
+                      - project_id: 43
+                        project_name: Internal Ops
+                        hours: 14.5
+                    missed_punch_count: 1
+                    overtime_count: 0
+                scope_meta:
+                  visible_users: 3
+                  visible_projects: 2
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/reports/profitability:
+    get:
+      tags: [Reports]
+      summary: Project profitability (Admin/FinMgr only — financial data)
+      description: |
+        Returns one row per visible project with hours plus the cost / revenue / margin figures
+        for the requested date range. Powers the `/financial` margin-per-project view.
+
+        **Date range:** the single required `date_range` query parameter takes the form
+        `YYYY-MM-DD/YYYY-MM-DD`. This replaces the off-spec `group_by`/`limit` query the web
+        client used before INC-004 (those are ignored by the backend); the frontend now sends
+        `date_range` (defaulting to the current month).
+
+        **RBAC (Admin/FinMgr only):** cost, revenue, and margin are financial data. This endpoint
+        is gated `@Roles('admin','finmgr')`; Manager and Employee callers receive 403
+        `RBAC_FORBIDDEN`. The web client additionally gates the page on `scope.canSeeFinancialData`
+        and only fires the query when that is true. This gate MUST NOT be widened.
+
+        Revenue follows each project's `billing_mode` (hourly → billable-rate × hours; fixed_fee →
+        the fixed fee; non_billable → 0). Cost uses the effective per-user cost rate over the range.
+
+        **Response envelope:** `{ items }` (with an optional `scope_meta`); the row field names are
+        `project_name` and `hours` (NOT the backend-internal `name`/`hours_total`).
+      operationId: getProfitability
+      parameters:
+        - $ref: '#/components/parameters/DateRange'
+      responses:
+        '200':
+          description: Profitability rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProfitabilityRow' }
+                  scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                required: [items]
+              example:
+                items:
+                  - project_id: 42
+                    project_name: Atlas
+                    client_name: Acme Corp
+                    billing_mode: hourly
+                    hours: 120
+                    billable_hours: 100
+                    revenue: 150000
+                    cost: 90000
+                    margin: 60000
+                    margin_pct: 40
+                    currency: ZAR
+                scope_meta:
+                  visible_users: -1
+                  visible_projects: -1
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ============================================================
+  # RATES (cost + billable; effective-dated; Admin/FinMgr only)
+  # ============================================================
+  /v1/cost-rates:
+    get:
+      tags: [Rates]
+      summary: List employee cost rates (Admin/FinMgr only)
+      description: |
+        Effective-dated per-user cost rates from `employee_cost_rates`. Admin/FinMgr ONLY — cost
+        is financial data; Manager/Employee receive 403 `RBAC_FORBIDDEN`. The web Rates page is
+        `canSeeFinancialData`-gated to mirror this server-side gate.
+
+        Two usage modes (both offset-paginated):
+        - `current=true` → the single active rate per user (`effective_from <= today AND
+          (effective_to IS NULL OR effective_to > today)`).
+        - `user_id=<id>` → that user's full rate history (newest first).
+      operationId: listCostRates
+      parameters:
+        - in: query
+          name: current
+          schema: { type: boolean }
+          description: When true, returns only the currently-effective rate per user.
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+          description: Restrict to one user's full rate history.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Offset-paginated cost rates.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CostRate' }
+                    required: [data]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 12
+                data:
+                  - id: 301
+                    user_id: 18
+                    user_display_name: Bob Example
+                    rate: 750
+                    currency: ZAR
+                    effective_from: 2026-01-01
+                    effective_to: null
+                    created_by: 1
+                    created_at: 2026-01-01T08:00:00+00:00
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Rates]
+      summary: Set a new effective-dated cost rate (Admin/FinMgr only)
+      description: |
+        Creates a new effective-dated cost rate for a user. The server end-dates the prior open
+        row and inserts the new one; the `ecr_no_overlap` GiST exclusion enforces that effective
+        ranges never overlap. `created_by` is set from the actor; an audit entry is written.
+
+        On an overlapping effective range (Postgres `23P01` exclusion violation), the server maps
+        the error to a clean 409 / 422 `VALIDATION_FAILED` rather than leaking the DB error.
+      operationId: createCostRate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCostRateRequest' }
+            example:
+              user_id: 18
+              rate: 800
+              currency: ZAR
+              effective_from: 2026-06-01
+      responses:
+        '201':
+          description: Cost rate created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CostRate' }
+              example:
+                id: 312
+                user_id: 18
+                user_display_name: Bob Example
+                rate: 800
+                currency: ZAR
+                effective_from: 2026-06-01
+                effective_to: null
+                created_by: 1
+                created_at: 2026-05-23T09:00:00+00:00
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Overlapping effective range for this user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: VALIDATION_FAILED
+                message: A cost rate already covers this effective range for user 18.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/billable-rates:
+    get:
+      tags: [Rates]
+      summary: List project / task billable rates (Admin/FinMgr only)
+      description: |
+        Effective-dated billable rates from `project_billable_rates`. Admin/FinMgr ONLY —
+        Manager/Employee receive 403 `RBAC_FORBIDDEN`.
+
+        Two usage modes (both offset-paginated):
+        - `current=true` → the currently-effective rate per project (and per task; the web client
+          treats the row with `task_id == null` as the project default).
+        - `project_id=<id>` → that project's full rate history (newest first).
+      operationId: listBillableRates
+      parameters:
+        - in: query
+          name: current
+          schema: { type: boolean }
+          description: When true, returns only the currently-effective rate per project/task.
+        - in: query
+          name: project_id
+          schema: { type: integer, format: int64 }
+          description: Restrict to one project's full rate history.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Offset-paginated billable rates.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/BillableRate' }
+                    required: [data]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 6
+                data:
+                  - id: 501
+                    project_id: 42
+                    task_id: null
+                    task_name: null
+                    rate: 1500
+                    currency: ZAR
+                    effective_from: 2026-01-01
+                    effective_to: null
+                    created_by: 1
+                    created_at: 2026-01-01T08:00:00+00:00
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Rates]
+      summary: Set a new effective-dated billable rate (Admin/FinMgr only)
+      description: |
+        Creates a new effective-dated billable rate for a project (optionally scoped to a task).
+        The server end-dates the prior open row and inserts the new one; the `pbr_no_overlap`
+        GiST exclusion enforces non-overlapping ranges. `created_by` is set from the actor; an
+        audit entry is written.
+
+        On an overlapping effective range (Postgres `23P01`), the server maps the error to a clean
+        409 / 422 `VALIDATION_FAILED`.
+      operationId: createBillableRate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBillableRateRequest' }
+            example:
+              project_id: 42
+              task_id: null
+              rate: 1600
+              currency: ZAR
+              effective_from: 2026-06-01
+      responses:
+        '201':
+          description: Billable rate created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillableRate' }
+              example:
+                id: 512
+                project_id: 42
+                task_id: null
+                task_name: null
+                rate: 1600
+                currency: ZAR
+                effective_from: 2026-06-01
+                effective_to: null
+                created_by: 1
+                created_at: 2026-05-23T09:00:00+00:00
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Overlapping effective range for this project/task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: VALIDATION_FAILED
+                message: A billable rate already covers this effective range for project 42.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
   # ============================================================
   # EXPORTS
   # ============================================================
@@ -2379,6 +2838,17 @@ components:
         maximum: 200
         default: 50
       description: Items per page (1..200, default 50).
+    DateRange:
+      in: query
+      name: date_range
+      required: true
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}$'
+      description: |
+        Inclusive local-date range in the form `YYYY-MM-DD/YYYY-MM-DD` (start/end). Used by the
+        GET report dashboards (`team-dashboard`, `profitability`). A malformed value returns 400
+        `VALIDATION_FAILED`.
     UserIdPath:
       in: path
       name: user_id
@@ -2625,7 +3095,7 @@ components:
       properties:
         session_token:
           type: string
-          description: Opaque bearer token to send in `Authorization: Bearer <...>` on subsequent calls.
+          description: 'Opaque bearer token to send in `Authorization: Bearer <...>` on subsequent calls.'
         expires_at: { type: string, format: date-time }
         user: { $ref: '#/components/schemas/User' }
       required: [session_token, expires_at, user]
@@ -2766,6 +3236,16 @@ components:
         id: { type: integer, format: int64 }
         project_id: { type: integer, format: int64 }
         user_id: { type: integer, format: int64 }
+        user_display_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Convenience join for the admin members table; may be absent on POST echoes.
+        user_email:
+          oneOf:
+            - { type: string, format: email }
+            - { type: 'null' }
+          description: Convenience join for the admin members table; may be absent on POST echoes.
         joined_at: { type: string, format: date }
         left_at:
           oneOf:
@@ -2785,6 +3265,16 @@ components:
         id: { type: integer, format: int64 }
         project_id: { type: integer, format: int64 }
         manager_id: { type: integer, format: int64 }
+        manager_display_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Convenience join for the admin managers table; may be absent on POST echoes.
+        manager_email:
+          oneOf:
+            - { type: string, format: email }
+            - { type: 'null' }
+          description: Convenience join for the admin managers table; may be absent on POST echoes.
         assigned_at: { type: string, format: date-time }
       required: [id, project_id, manager_id, assigned_at]
 
@@ -3030,6 +3520,11 @@ components:
 
     CreateScheduleOverrideRequest:
       type: object
+      description: |
+        Authoritative request shape for `POST /v1/schedules/overrides` (INC-004). Uses
+        `effective_from`/`effective_to` (dates) + `start_time`/`end_time` (HH:MM) +
+        `user_id`/`project_id` + optional lunch fields and `reason`. The backend Zod schema
+        is aligned to this; the legacy `date_range`/`new_start`/`target_id` form is retired.
       properties:
         scope:
           type: string
@@ -3350,6 +3845,137 @@ components:
           description: Present only for Admin/FinMgr.
       required: [group_key, hours, billable_hours, non_billable_hours]
 
+    TeamDashboardRow:
+      type: object
+      description: |
+        One row per visible user for the team dashboard (`GET /v1/reports/team-dashboard`).
+        Hours-only — carries NO cost / billable-rate / margin fields for any caller.
+      properties:
+        user_id: { type: integer, format: int64 }
+        display_name: { type: string }
+        total_hours: { type: number, format: float }
+        billable_hours:
+          type: number
+          format: float
+          description: Optional billable split; the table does not require it.
+        non_billable_hours:
+          type: number
+          format: float
+          description: Optional non-billable split.
+        hours_by_project:
+          type: array
+          items:
+            type: object
+            properties:
+              project_id: { type: integer, format: int64 }
+              project_name: { type: string }
+              hours: { type: number, format: float }
+            required: [project_id, project_name, hours]
+        missed_punch_count: { type: integer }
+        overtime_count: { type: integer }
+      required: [user_id, display_name, total_hours, hours_by_project, missed_punch_count, overtime_count]
+
+    ProfitabilityRow:
+      type: object
+      description: |
+        One row per visible project for the financial dashboard (`GET /v1/reports/profitability`).
+        Admin/FinMgr only — always carries the cost / revenue / margin fields (there is no
+        stripped variant; non-financial roles are blocked at the route with 403).
+      properties:
+        project_id: { type: integer, format: int64 }
+        project_name: { type: string }
+        client_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        hours: { type: number, format: float }
+        billable_hours: { type: number, format: float }
+        revenue: { type: number, format: float }
+        cost: { type: number, format: float }
+        margin: { type: number, format: float }
+        margin_pct: { type: number, format: float }
+        currency: { type: string }
+      required: [project_id, project_name, hours, revenue, cost, margin, margin_pct, currency]
+
+    # ---------- Rates ----------
+    CostRate:
+      type: object
+      description: |
+        Effective-dated per-user cost rate (`employee_cost_rates`). Financial data — only
+        returned to Admin/FinMgr.
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        user_display_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Convenience join for the admin table; may be absent on POST echoes.
+        rate: { type: number, format: float }
+        currency: { type: string, minLength: 3, maxLength: 3, description: ISO 4217. }
+        effective_from: { type: string, format: date }
+        effective_to:
+          oneOf:
+            - { type: string, format: date }
+            - { type: 'null' }
+          description: '`null` for the currently-open (active) row.'
+        created_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+      required: [user_id, rate, currency, effective_from, created_by, created_at]
+
+    CreateCostRateRequest:
+      type: object
+      properties:
+        user_id: { type: integer, format: int64 }
+        rate: { type: number, format: float, minimum: 0 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        effective_from: { type: string, format: date }
+      required: [user_id, rate, currency, effective_from]
+
+    BillableRate:
+      type: object
+      description: |
+        Effective-dated project (and optional per-task) billable rate (`project_billable_rates`).
+        Financial data — only returned to Admin/FinMgr. The row with `task_id == null` is the
+        project default.
+      properties:
+        id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        task_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        task_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        rate: { type: number, format: float }
+        currency: { type: string, minLength: 3, maxLength: 3, description: ISO 4217. }
+        effective_from: { type: string, format: date }
+        effective_to:
+          oneOf:
+            - { type: string, format: date }
+            - { type: 'null' }
+          description: '`null` for the currently-open (active) row.'
+        created_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+      required: [project_id, rate, currency, effective_from, created_by, created_at]
+
+    CreateBillableRateRequest:
+      type: object
+      properties:
+        project_id: { type: integer, format: int64 }
+        task_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+          description: Omit (or null) to set the project default rate.
+        rate: { type: number, format: float, minimum: 0 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        effective_from: { type: string, format: date }
+      required: [project_id, rate, currency, effective_from]
+
     # ---------- Exports ----------
     CreateExportRequest:
       type: object
@@ -3520,7 +4146,7 @@ components:
         metadata:
           type: object
           additionalProperties: true
-          description: e.g. `{ client: "web", provider: "openai", model: "gpt-4o" }`.
+          description: 'e.g. `{ client: "web", provider: "openai", model: "gpt-4o" }`.'
       required: [id, user_id, started_at, last_message_at, metadata]
 
     ChatbotMessage:

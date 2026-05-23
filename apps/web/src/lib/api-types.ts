@@ -89,6 +89,11 @@ export interface TeamDashboardRow {
   user_id: string;
   display_name: string;
   total_hours: number;
+  // INC-004: the team-dashboard endpoint also emits billable / non-billable
+  // splits per row. The table does not render them today, but they are part of
+  // the response shape, so keep them optional to stay aligned with the backend.
+  billable_hours?: number;
+  non_billable_hours?: number;
   hours_by_project: Array<{ project_id: string; project_name: string; hours: number }>;
   missed_punch_count: number;
   overtime_count: number;

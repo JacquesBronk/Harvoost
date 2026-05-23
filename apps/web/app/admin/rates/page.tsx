@@ -39,12 +39,6 @@ import type {
   User,
 } from '@/lib/api-types.js';
 
-// TODO(post-merge): swap to generated types once the cost-rates and
-// billable-rates backend modules land. The endpoint paths used below
-// (`/v1/cost-rates` and `/v1/billable-rates`) follow the architecture
-// document's effective-dated rate pattern; verify against openapi.yaml
-// when those modules are added.
-
 const COMMON_CURRENCIES = ['ZAR', 'USD', 'EUR', 'GBP'];
 
 interface CostRateEditorState {

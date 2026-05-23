@@ -7,6 +7,14 @@ import { AppModule } from './app.module';
 import { loadEnv } from './config/env';
 import { CsrfMiddleware } from './common/middleware/csrf.middleware';
 
+// Postgres bigint columns surface as JS BigInt via $queryRaw; JSON.stringify cannot
+// serialize BigInt. Render them as decimal strings (the API already returns string IDs
+// everywhere else). Installed process-wide before bootstrap so it covers the older list
+// endpoints (GET /v1/users, /v1/projects, /v1/clients) that return raw rows.
+(BigInt.prototype as unknown as { toJSON: () => string }).toJSON = function () {
+  return this.toString();
+};
+
 async function bootstrap() {
   const env = loadEnv();
   const logger = new Logger('Bootstrap');

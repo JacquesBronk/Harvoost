@@ -1,0 +1,18 @@
+{
+  "name": "@harvoost/contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAPI-driven FE<->BE contract test. Statically asserts that every apps/web apiFetch() call maps to a declared openapi.yaml operation AND a registered NestJS route, and that the FE's read envelope/fields match the spec response schema. Durable fix for the INC-004 'frontend-invented endpoints' (M7) drift class.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.0",
+    "yaml": "^2.5.0"
+  }
+}

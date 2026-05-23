@@ -25,7 +25,7 @@ import { ScopeMetaIndicator } from '@/components/ScopeMetaIndicator.js';
 import { apiFetch } from '@/lib/api-client.js';
 import { useCurrentUser } from '@/lib/auth.js';
 import { useScope } from '@/lib/rbac.js';
-import { formatHours, isoWeekRange, viewerTimeZone } from '@/lib/tz.js';
+import { dateRangeParam, formatHours, isoWeekRange, viewerTimeZone } from '@/lib/tz.js';
 import type { ScopedList, TeamDashboardRow } from '@/lib/api-types.js';
 
 export default function DashboardPage() {
@@ -38,32 +38,41 @@ export default function DashboardPage() {
     'this_week',
   );
 
+  // INC-004: the team-dashboard endpoint reads a single inclusive local-date
+  // `date_range=YYYY-MM-DD/YYYY-MM-DD`, not ISO `start_at_from`/`start_at_to`.
+  // Build the range from the selected week/month in the viewer's zone and
+  // expose the inclusive [fromDate, toDate] local dates the param needs.
   const range = useMemo(() => {
     const now = DateTime.now().setZone(zone);
-    if (rangeKey === 'this_week') {
-      const w = isoWeekRange(now.toISO() ?? '', zone);
-      return { from: w.startIso, to: w.endIso, label: w.weekLabel };
-    }
-    if (rangeKey === 'last_week') {
-      const w = isoWeekRange(now.minus({ weeks: 1 }).toISO() ?? '', zone);
-      return { from: w.startIso, to: w.endIso, label: w.weekLabel };
+    if (rangeKey === 'this_week' || rangeKey === 'last_week') {
+      const anchor = rangeKey === 'last_week' ? now.minus({ weeks: 1 }) : now;
+      const start = anchor.startOf('week'); // ISO Mon
+      const lastDay = start.plus({ days: 6 }); // Sun, inclusive
+      const w = isoWeekRange(anchor.toISO() ?? '', zone);
+      return {
+        fromDate: start.toISODate() ?? '',
+        toDate: lastDay.toISODate() ?? '',
+        label: w.weekLabel,
+      };
     }
     const start = now.startOf('month');
-    const end = start.plus({ months: 1 });
+    const lastDay = start.endOf('month'); // last day of month, inclusive
     return {
-      from: start.toUTC().toISO() ?? '',
-      to: end.toUTC().toISO() ?? '',
+      fromDate: start.toISODate() ?? '',
+      toDate: lastDay.toISODate() ?? '',
       label: start.toFormat('LLLL yyyy'),
     };
   }, [rangeKey, zone]);
 
+  const dateRange = dateRangeParam(range.fromDate, range.toDate);
+
   const dashboard = useQuery({
-    queryKey: ['dashboard', 'team', range.from, range.to],
+    queryKey: ['dashboard', 'team', dateRange],
     queryFn: () =>
       apiFetch<ScopedList<TeamDashboardRow>>('/v1/reports/team-dashboard', {
-        query: { start_at_from: range.from, start_at_to: range.to },
+        query: { date_range: dateRange },
       }),
-    enabled: !!user,
+    enabled: !!user && !!dateRange,
   });
 
   const restricted = !!user && !scope.canApproveStage1 && !scope.canApproveStage2;
