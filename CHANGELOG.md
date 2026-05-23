@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Web app no longer hangs on an infinite loader at `http://localhost:3000/` against the full docker-compose stack ([#1](https://github.com/JacquesBronk/Harvoost/issues/1)). The static CSP `script-src 'self' 'wasm-unsafe-eval'` in `apps/web/next.config.mjs` was blocking Next.js 14's inline RSC flight-payload scripts, so `ClientPageRoot` never hydrated and the SSR'd `LoadingSpinner` was terminal. Replaced with a per-request nonce strategy via new `apps/web/middleware.ts` (CSP set on both request and response headers, nonce auto-propagated to Next.js's inline scripts), and `app/layout.tsx` now calls `headers()` to opt the route tree into dynamic rendering so the nonce is in scope at render time.
+- `harvoost-web` container no longer reports `unhealthy` despite serving HTTP 200. Docker sets `HOSTNAME=<containerID>` by default; Next.js standalone reads `HOSTNAME` and binds to that single bridge-IP address, so the in-container `fetch('http://localhost:3000/')` healthcheck got `ECONNREFUSED`. Now pinned to `HOSTNAME=0.0.0.0` in `docker-compose.yml`.
+- `NEXT_PUBLIC_API_BASE_URL` is now explicitly baked into the web bundle at build time via a Dockerfile `ARG` + `docker-compose.yml` `build.args` entry. Previously only the source-default `http://localhost:3001` ever ended up in the bundle (Next.js bakes `NEXT_PUBLIC_*` at build, not runtime), masking a latent footgun where changing the api port without also editing `apps/web/src/lib/env.ts` would silently fail.
+
 ### Planned for v0.2.0 / v1.0.1
 
 - Wire real Microsoft Entra ID OIDC validation against `login.microsoftonline.com` for production sign-in (currently dev-only via Keycloak; prod is fail-closed until this lands).

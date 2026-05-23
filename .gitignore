@@ -1,5 +1,8 @@
-# HackTogether runtime state — never commit
-.hacktogether/
+# HackTogether runtime state.
+# Top-level files (e.g. secrets.local.md) stay ignored; the runs/ tree is
+# committed because it captures the agentic SDLC artefacts for this repo.
+.hacktogether/*
+!.hacktogether/runs/
 
 # Secrets
 .env

@@ -32,6 +32,16 @@ COPY packages/shared ./packages/shared
 COPY packages/ui ./packages/ui
 
 ENV NEXT_TELEMETRY_DISABLED=1
+
+# NEXT_PUBLIC_* values are baked into the client bundle at build time by
+# webpack's DefinePlugin — setting them only at runtime via docker-compose
+# `environment:` has no effect on the compiled JS. We accept it as a build
+# ARG and re-export as an ENV so `next build` sees it. The default keeps
+# `docker build` working without an explicit --build-arg; docker-compose
+# passes the canonical value via the `build.args` block.
+ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
+ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
+
 RUN pnpm --filter @harvoost/web build
 
 FROM node:${NODE_VERSION}-alpine AS runtime

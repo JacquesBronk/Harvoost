@@ -19,7 +19,9 @@ const nextConfig = {
     return config;
   },
   async headers() {
-    const apiOrigin = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001';
+    // Note: `Content-Security-Policy` is set per-request by `middleware.ts` so it can include
+    // a fresh nonce that Next.js's RSC inline scripts can carry. The remaining static headers
+    // below do not vary per request and stay here.
     return [
       {
         source: '/(.*)',
@@ -27,19 +29,6 @@ const nextConfig = {
           { key: 'X-Frame-Options', value: 'DENY' },
           { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
           { key: 'X-Content-Type-Options', value: 'nosniff' },
-          {
-            key: 'Content-Security-Policy',
-            value: [
-              "default-src 'self'",
-              "script-src 'self' 'wasm-unsafe-eval'",
-              "style-src 'self' 'unsafe-inline'",
-              "img-src 'self' data: blob:",
-              `connect-src 'self' ${apiOrigin}`,
-              "frame-ancestors 'none'",
-              "base-uri 'self'",
-              "form-action 'self'",
-            ].join('; '),
-          },
         ],
       },
     ];

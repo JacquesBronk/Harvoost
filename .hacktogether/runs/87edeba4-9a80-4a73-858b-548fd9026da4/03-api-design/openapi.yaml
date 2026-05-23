@@ -1,0 +1,3579 @@
+openapi: 3.1.0
+info:
+  title: Harvoost API
+  version: 1.0.0
+  description: |
+    Harvoost — Harvest-style time-tracking SaaS for a single tenant on Azure.
+    Provides endpoints for time entries, mood capture, scheduling, leave booking,
+    two-stage approvals, exception handling, financial dashboards, Harvest-compatible
+    Excel export, an RBAC-aware manager chatbot, and autonomous weekly summaries.
+
+    ## Authentication
+    Bearer token (opaque server-issued session id) in the `Authorization` header.
+    The token is minted by `apps/api` after the Entra ID OIDC handshake completes.
+    Token lifetime is 12h; clients refresh via `POST /v1/auth/refresh` (separate spec).
+
+    ## Field casing
+    All JSON field names, path parameters, and query parameters use `snake_case`.
+
+    ## Error envelope
+    Uniform shape across the entire API: `{ code, message, details? }`. See `ErrorResponse` schema.
+
+    ## Pagination
+    - **Cursor-based** for high-volume / append-mostly resources: time_entries, audit_log,
+      exceptions, chatbot_conversations, chatbot_messages, leave_requests.
+    - **Offset-based** for catalog-style resources: users, projects, clients.
+
+    ## Idempotency
+    `Idempotency-Key` header is REQUIRED on `POST /v1/time-entries/start`, `/stop`, and
+    `/switch`. The server stores `(user_id, idempotency_key) → response` for 5 minutes;
+    retried requests with the same key return the original response. Reuse of the same
+    key with a different payload returns `409 IDEMPOTENCY_CONFLICT`.
+
+    ## ISO 8601
+    Every date-time field is ISO 8601 with explicit offset (e.g. `2026-05-22T09:30:00+02:00`).
+    Server stores in UTC; clients render in viewer's TZ.
+
+    ## RBAC
+    Scoped LIST responses include a `scope_meta` object (`{ visible_users, visible_projects }`)
+    for client empty-state UX. Out-of-scope drill-downs return 403 `RBAC_FORBIDDEN`. The
+    chatbot's "no data accessible" responses come back as 200s with a polite reply — NOT 403s.
+
+    ## Cost-column stripping
+    For `POST /v1/reports/*` and `POST /v1/exports/excel`, the response schema for Manager
+    and Employee callers omits `cost_rate`, `cost_amount`, and the aggregate `margin_*` fields.
+    The behavior is described in each operation's description.
+
+    ## Rate limits
+    Chatbot endpoints and `POST /v1/exports/*` return `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+    and `X-RateLimit-Reset` headers. Chatbot has both a request-rate cap (30/min) and a per-user
+    daily token budget (default 50000 tokens, configurable in `org_settings`).
+
+    ## Versioning
+    Path-based: `/v1`. When `/v2` ships, `/v1` remains available for at least 6 months;
+    deprecation surfaced via `Sunset` and `Deprecation` HTTP response headers.
+  contact:
+    name: Harvoost engineering
+    email: noreply@harvoost.example.com
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.harvoost.example
+    description: Production (single-tenant, Azure South Africa North)
+  - url: http://localhost:3001
+    description: Local development (apps/api default port)
+
+tags:
+  - name: Auth
+    description: Entra ID OIDC handshake; session minting; current-user lookup.
+  - name: Users
+    description: User CRUD-ish (creation is implicit via first OIDC login + admin allowlist).
+  - name: Clients
+    description: Customer / client records.
+  - name: Projects
+    description: Projects and their memberships, managers, and rates.
+  - name: Tasks
+    description: Project sub-categories.
+  - name: TimeEntries
+    description: Core time tracking — manual entries, timer start/stop/switch, weekly submission.
+  - name: Mood
+    description: Daily mood capture and manager-aggregate views with k>=5 anonymity.
+  - name: Schedules
+    description: Schedule templates and overrides; dashboard views.
+  - name: Leave
+    description: Leave request booking and approval.
+  - name: Approvals
+    description: Two-stage timesheet approval workflow.
+  - name: Exceptions
+    description: Missed punches, overtime, anomalies — detection and resolution.
+  - name: Reports
+    description: Detailed activity and rolled-up time reports; RBAC-scoped; cost columns stripped for non-financial roles.
+  - name: Exports
+    description: Harvest-compatible Excel export; sync (<=100k rows) or async (>100k rows).
+  - name: Chatbot
+    description: RBAC-aware natural-language Q&A over scoped data (LLM tool calling).
+  - name: AuditLog
+    description: Append-only audit log (Admin/FinMgr only).
+  - name: Health
+    description: Liveness / readiness probes (unauthenticated).
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ============================================================
+  # HEALTH (unauthenticated)
+  # ============================================================
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Liveness + readiness check
+      description: |
+        Unauthenticated endpoint returning component-level status checks. Used by Azure
+        Container Apps health probes and by client-side connectivity tests.
+      security: []
+      operationId: getHealth
+      responses:
+        '200':
+          description: All components healthy or degraded but operational.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  value:
+                    status: ok
+                    version: 1.0.0
+                    db: ok
+                    redis: not_configured
+                    llm: ok
+        '503':
+          description: One or more components down.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # ============================================================
+  # AUTH
+  # ============================================================
+  /v1/auth/oidc/login:
+    post:
+      tags: [Auth]
+      summary: Initiate Entra ID OIDC handshake
+      description: |
+        Returns the Entra ID authorize URL the client should redirect to (web) or open
+        in the system browser (tray). Includes PKCE code-challenge and state nonce.
+      operationId: initiateOidcLogin
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcLoginRequest'
+            example:
+              client_kind: web
+              redirect_uri: https://app.harvoost.example/v1/auth/callback
+      responses:
+        '200':
+          description: Authorize URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcLoginResponse'
+              example:
+                authorize_url: https://login.microsoftonline.com/abc.../oauth2/v2.0/authorize?...
+                state: 7f9c-a3...
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/auth/oidc/callback:
+    post:
+      tags: [Auth]
+      summary: Complete OIDC handshake and mint a Harvoost session
+      description: |
+        Exchanges the Entra ID authorization code for a Harvoost session token.
+        This endpoint is the one place in the API that does NOT require a bearer token.
+        On success, returns an opaque session token (bearer) and the user profile.
+      operationId: completeOidcCallback
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcCallbackRequest'
+            example:
+              code: 0.AAAA...
+              state: 7f9c-a3...
+              code_verifier: <pkce-verifier>
+              client_kind: web
+      responses:
+        '200':
+          description: Session minted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+              example:
+                session_token: opaque-base64url-token...
+                expires_at: 2026-05-23T04:00:00+00:00
+                user:
+                  id: 17
+                  email: alice@harvoost.example.com
+                  display_name: Alice Example
+                  roles: [manager]
+                  timezone: Africa/Johannesburg
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: OIDC state mismatch, code expired, or token validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: OIDC_FAILURE
+                message: OIDC state mismatch.
+
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current session
+      description: Marks the current session as revoked. Subsequent requests with this token return 401.
+      operationId: logout
+      responses:
+        '204':
+          description: Session revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user + roles + scope summary
+      description: |
+        Returns the authenticated user with roles, timezone, and the scope_meta summary
+        the client uses to render empty-state messaging.
+      operationId: getMe
+      responses:
+        '200':
+          description: Current user profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+              example:
+                user:
+                  id: 17
+                  email: alice@harvoost.example.com
+                  display_name: Alice Example
+                  roles: [manager]
+                  timezone: Africa/Johannesburg
+                  weekly_summary_opt_out: false
+                scope_meta:
+                  visible_users: 12
+                  visible_projects: 3
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ============================================================
+  # USERS
+  # ============================================================
+  /v1/users:
+    get:
+      tags: [Users]
+      summary: List users (Admin only)
+      description: |
+        Admin-only. Lists all users with offset pagination. User creation is implicit
+        via first OIDC login + admin allowlist — there is no `POST /v1/users`.
+      operationId: listUsers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - in: query
+          name: is_active
+          schema: { type: boolean }
+          description: Filter by active flag.
+        - in: query
+          name: role
+          schema:
+            $ref: '#/components/schemas/Role'
+          description: Filter to users holding a specific role.
+        - in: query
+          name: search
+          schema: { type: string }
+          description: Substring match on display_name or email.
+      responses:
+        '200':
+          description: Paginated users.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/User' }
+                    required: [data]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 137
+                data:
+                  - id: 17
+                    email: alice@harvoost.example.com
+                    display_name: Alice Example
+                    roles: [manager]
+                    timezone: Africa/Johannesburg
+                    weekly_summary_opt_out: false
+                    is_active: true
+                    created_at: 2026-04-01T08:00:00+00:00
+                    updated_at: 2026-05-22T08:00:00+00:00
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    get:
+      tags: [Users]
+      summary: Get a single user by id
+      description: Admin sees any user; other roles see only users in their RBAC scope.
+      operationId: getUser
+      responses:
+        '200':
+          description: User found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Users]
+      summary: Update user fields
+      description: |
+        Admin can update timezone, display_name, is_active, weekly_summary_opt_out.
+        A user updating themselves may only change `timezone` and `weekly_summary_opt_out`.
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateUserRequest' }
+            example:
+              timezone: Europe/London
+              weekly_summary_opt_out: true
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/users/{user_id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    post:
+      tags: [Users]
+      summary: Assign a role to a user (Admin only)
+      operationId: assignRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignRoleRequest' }
+            example:
+              role: manager
+      responses:
+        '201':
+          description: Role assigned (or already present — idempotent).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/users/{user_id}/roles/{role}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+      - in: path
+        name: role
+        required: true
+        schema: { $ref: '#/components/schemas/Role' }
+    delete:
+      tags: [Users]
+      summary: Revoke a role from a user (Admin only)
+      operationId: revokeRole
+      responses:
+        '204':
+          description: Role revoked (or was already absent).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # CLIENTS
+  # ============================================================
+  /v1/clients:
+    get:
+      tags: [Clients]
+      summary: List clients (offset-paginated)
+      description: All authenticated users may read clients; only Admin/FinMgr may write.
+      operationId: listClients
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - in: query
+          name: is_active
+          schema: { type: boolean }
+        - in: query
+          name: search
+          schema: { type: string }
+      responses:
+        '200':
+          description: Paginated clients.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Client' }
+                    required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Clients]
+      summary: Create client (Admin/FinMgr only)
+      operationId: createClient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateClientRequest' }
+            example:
+              name: Acme Corp
+              is_active: true
+      responses:
+        '201':
+          description: Client created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Client' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/clients/{client_id}:
+    parameters:
+      - in: path
+        name: client_id
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Clients]
+      summary: Update client (Admin/FinMgr only)
+      operationId: updateClient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateClientRequest' }
+      responses:
+        '200':
+          description: Updated client.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Client' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Clients]
+      summary: Archive client (Admin/FinMgr only; soft delete)
+      operationId: deleteClient
+      responses:
+        '204':
+          description: Client archived.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # PROJECTS
+  # ============================================================
+  /v1/projects:
+    get:
+      tags: [Projects]
+      summary: List projects (RBAC-scoped, offset-paginated)
+      description: |
+        Admin and FinMgr see all projects. Managers see projects in their anchored set.
+        Employees see projects they are a member of.
+      operationId: listProjects
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - in: query
+          name: client_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: billing_mode
+          schema: { $ref: '#/components/schemas/BillingMode' }
+        - in: query
+          name: is_active
+          schema: { type: boolean }
+        - in: query
+          name: search
+          schema: { type: string }
+      responses:
+        '200':
+          description: Paginated projects.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OffsetPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Project' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+              example:
+                page: 1
+                page_size: 50
+                total_count: 8
+                data:
+                  - id: 42
+                    client_id: 7
+                    code: ATL
+                    name: Atlas
+                    billing_mode: hourly
+                    currency: ZAR
+                    hours_budget: 320
+                    department: Delivery
+                    is_active: true
+                    created_at: 2026-04-01T08:00:00+00:00
+                    updated_at: 2026-05-10T13:00:00+00:00
+                scope_meta:
+                  visible_users: 12
+                  visible_projects: 8
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Projects]
+      summary: Create project (Admin only)
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectRequest' }
+            example:
+              client_id: 7
+              code: ATL
+              name: Atlas
+              billing_mode: hourly
+              currency: ZAR
+              hours_budget: 320
+              department: Delivery
+      responses:
+        '201':
+          description: Project created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/projects/{project_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+    get:
+      tags: [Projects]
+      summary: Get project by id
+      description: RBAC-scoped. Out-of-scope drill-down returns 403 RBAC_FORBIDDEN.
+      operationId: getProject
+      responses:
+        '200':
+          description: Project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Projects]
+      summary: Update project
+      description: |
+        Admin may update billing_mode, code, name, owner, is_active, hours_budget, department.
+        FinMgr may update only the rate-related fields (billable_rate via project_billable_rates
+        is a separate sub-resource — this endpoint only touches project-level scalar fields
+        that FinMgr is allowed to manage: currency, hours_budget, fixed_fee_amount).
+      operationId: updateProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProjectRequest' }
+            example:
+              name: Atlas v2
+              hours_budget: 480
+      responses:
+        '200':
+          description: Updated project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/projects/{project_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+    post:
+      tags: [Projects]
+      summary: Add a member to a project (Admin only)
+      operationId: addProjectMember
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddProjectMemberRequest' }
+            example:
+              user_id: 18
+              joined_at: 2026-05-22
+      responses:
+        '201':
+          description: Member added.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMember' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/projects/{project_id}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+      - $ref: '#/components/parameters/UserIdPath'
+    delete:
+      tags: [Projects]
+      summary: Remove a member from a project (Admin only; soft delete sets left_at)
+      operationId: removeProjectMember
+      responses:
+        '204':
+          description: Member removed.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/projects/{project_id}/managers:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+    post:
+      tags: [Projects]
+      summary: Anchor a manager to this project (Admin only)
+      operationId: addProjectManager
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddProjectManagerRequest' }
+            example:
+              manager_id: 17
+      responses:
+        '201':
+          description: Manager anchored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectManagerAnchor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/projects/{project_id}/managers/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+      - $ref: '#/components/parameters/UserIdPath'
+    delete:
+      tags: [Projects]
+      summary: Remove a manager anchor from this project (Admin only)
+      operationId: removeProjectManager
+      responses:
+        '204':
+          description: Anchor removed.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # PROJECT TASKS
+  # ============================================================
+  /v1/projects/{project_id}/tasks:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+    get:
+      tags: [Tasks]
+      summary: List tasks within a project
+      description: RBAC-scoped (project visibility).
+      operationId: listProjectTasks
+      parameters:
+        - in: query
+          name: is_active
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Tasks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProjectTask' }
+                required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Tasks]
+      summary: Create a task within a project (Admin/FinMgr only)
+      operationId: createProjectTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectTaskRequest' }
+            example:
+              name: Development
+              is_billable: true
+      responses:
+        '201':
+          description: Task created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/projects/{project_id}/tasks/{task_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectIdPath'
+      - in: path
+        name: task_id
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Tasks]
+      summary: Update a task (Admin/FinMgr only)
+      operationId: updateProjectTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProjectTaskRequest' }
+      responses:
+        '200':
+          description: Updated task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ============================================================
+  # TIME ENTRIES
+  # ============================================================
+  /v1/time-entries:
+    get:
+      tags: [TimeEntries]
+      summary: List time entries (cursor-paginated, RBAC-scoped)
+      description: |
+        Returns time entries the requester is allowed to see. Employees see only their own;
+        Managers see entries from users-and-projects in their cascade scope; FinMgr and Admin
+        see all. Cost fields are stripped for Manager/Employee callers (see ARCHITECTURE.md §
+        cost-stripping).
+      operationId: listTimeEntries
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: project_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: task_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/TimeEntryStatus' }
+        - in: query
+          name: billable
+          schema: { type: boolean }
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+          description: Inclusive lower bound on local date.
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+          description: Inclusive upper bound on local date.
+      responses:
+        '200':
+          description: Paginated time entries.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/TimeEntry' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+              example:
+                data:
+                  - id: 9001
+                    user_id: 18
+                    project_id: 42
+                    task_id: 5
+                    notes: Pair-prog on the report aggregator
+                    start_at: 2026-05-22T08:02:00+02:00
+                    end_at: 2026-05-22T12:18:00+02:00
+                    status: draft
+                    billable: true
+                    mood_score: 4
+                    created_at: 2026-05-22T08:02:00+00:00
+                    updated_at: 2026-05-22T12:18:00+00:00
+                next_cursor: eyJpZCI6OTAwMX0
+                prev_cursor: null
+                scope_meta:
+                  visible_users: 12
+                  visible_projects: 8
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [TimeEntries]
+      summary: Create a manual time entry
+      description: |
+        Creates a time entry for the requester. `start_at` and `end_at` must both be set;
+        `end_at > start_at`; duration <= 24h; no overlap with any other entry of the same user.
+        On overlap or running-timer conflict, returns 409.
+      operationId: createTimeEntry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTimeEntryRequest' }
+            example:
+              project_id: 42
+              task_id: 5
+              notes: Sprint planning
+              start_at: 2026-05-22T08:00:00+02:00
+              end_at: 2026-05-22T09:00:00+02:00
+              billable: true
+      responses:
+        '201':
+          description: Time entry created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimeEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Overlapping entry or running-timer conflict.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: VALIDATION_FAILED
+                message: Entry overlaps with another entry [9001] for the same user.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/time-entries/running:
+    get:
+      tags: [TimeEntries]
+      summary: Get the requester's currently-running time entry (or null)
+      operationId: getRunningTimeEntry
+      responses:
+        '200':
+          description: Running entry or null.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    oneOf:
+                      - { $ref: '#/components/schemas/TimeEntry' }
+                      - { type: 'null' }
+                required: [data]
+              examples:
+                running:
+                  value:
+                    data:
+                      id: 9001
+                      user_id: 18
+                      project_id: 42
+                      task_id: 5
+                      notes: WIP
+                      start_at: 2026-05-22T08:02:00+02:00
+                      end_at: null
+                      status: running
+                      billable: true
+                      mood_score: 4
+                      created_at: 2026-05-22T08:02:00+00:00
+                      updated_at: 2026-05-22T08:02:00+00:00
+                none:
+                  value:
+                    data: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/time-entries/start:
+    post:
+      tags: [TimeEntries]
+      summary: Start a running timer (idempotent; tray + web)
+      description: |
+        Starts a new running time entry for the requester. If another entry is already running,
+        returns 409 — clients should use `/v1/time-entries/switch` for atomic stop+start.
+
+        The `Idempotency-Key` header is REQUIRED. Retried requests with the same key + same
+        payload return the original response. Reuse with a different payload returns 409
+        `IDEMPOTENCY_CONFLICT`.
+      operationId: startTimeEntry
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartTimeEntryRequest' }
+            example:
+              project_id: 42
+              task_id: 5
+              notes: Morning standup + report aggregator
+              mood_score: 4
+              client_started_at: 2026-05-22T08:02:00+02:00
+      responses:
+        '201':
+          description: Timer started.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimeEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: |
+            - A different running timer already exists for the requester (use `/switch`).
+            - The same `Idempotency-Key` was used with a different payload → `IDEMPOTENCY_CONFLICT`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                running_already:
+                  value:
+                    code: VALIDATION_FAILED
+                    message: Another timer is already running for this user. Use /switch to change projects.
+                idempotency_conflict:
+                  value:
+                    code: IDEMPOTENCY_CONFLICT
+                    message: Idempotency-Key reused with a different payload.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/time-entries/stop:
+    post:
+      tags: [TimeEntries]
+      summary: Stop the requester's running timer (idempotent)
+      description: |
+        Stops whichever entry is currently running. The `Idempotency-Key` header is REQUIRED.
+        Retried requests return the original response. If no timer is running, returns 200 with
+        `data: null` (the operation is a no-op, not an error).
+      operationId: stopTimeEntry
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StopTimeEntryRequest' }
+            example:
+              client_stopped_at: 2026-05-22T12:18:00+02:00
+              notes: Done with the aggregator
+      responses:
+        '200':
+          description: Timer stopped (or was already stopped).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    oneOf:
+                      - { $ref: '#/components/schemas/TimeEntry' }
+                      - { type: 'null' }
+                required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Idempotency-Key reused with a different payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/time-entries/switch:
+    post:
+      tags: [TimeEntries]
+      summary: Atomically stop the running timer and start a new one (idempotent)
+      description: |
+        Stops the current running entry and starts a new one in a single transaction (no gap,
+        no overlap). The `Idempotency-Key` header is REQUIRED.
+      operationId: switchTimeEntry
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SwitchTimeEntryRequest' }
+            example:
+              new_project_id: 43
+              new_task_id: 9
+              new_notes: Switching to Internal Ops
+              client_switched_at: 2026-05-22T12:18:00+02:00
+      responses:
+        '200':
+          description: Stop + start completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SwitchTimeEntryResponse' }
+              example:
+                stopped:
+                  id: 9001
+                  status: draft
+                  end_at: 2026-05-22T12:18:00+02:00
+                started:
+                  id: 9002
+                  status: running
+                  start_at: 2026-05-22T12:18:00+02:00
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: No timer running OR Idempotency-Key conflict.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/time-entries/{entry_id}:
+    parameters:
+      - $ref: '#/components/parameters/EntryIdPath'
+    patch:
+      tags: [TimeEntries]
+      summary: Edit a time entry
+      description: |
+        Editable only when status is `draft` or `rejected`. Entries with status `submitted`,
+        `manager_approved`, or `final_approved` return 409 `ENTRY_LOCKED`. Admin unlock is a
+        separate endpoint (`POST /v1/approvals/admin-unlock/{entry_id}`).
+      operationId: updateTimeEntry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTimeEntryRequest' }
+            example:
+              notes: Corrected the project assignment
+              project_id: 42
+              task_id: 7
+      responses:
+        '200':
+          description: Updated entry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimeEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Entry locked by approval state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: ENTRY_LOCKED
+                message: Cannot edit entry — currently in status manager_approved.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [TimeEntries]
+      summary: Delete a time entry (soft delete)
+      description: Same lock rules as PATCH; locked entries return 409 `ENTRY_LOCKED`.
+      operationId: deleteTimeEntry
+      responses:
+        '204':
+          description: Entry deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Entry locked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/time-entries/{entry_id}/submit:
+    parameters:
+      - $ref: '#/components/parameters/EntryIdPath'
+    post:
+      tags: [TimeEntries]
+      summary: Submit a draft entry (or its whole week) for stage-1 approval
+      description: |
+        Convenience operation. With `scope=entry` the single entry transitions draft → submitted.
+        With `scope=week` all draft entries in the same ISO week (in the requester's TZ) submit
+        atomically. Locked entries are skipped.
+      operationId: submitTimeEntry
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitTimeEntryRequest' }
+            example:
+              scope: week
+      responses:
+        '200':
+          description: Submitted entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  submitted_ids:
+                    type: array
+                    items: { type: integer, format: int64 }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        entry_id: { type: integer, format: int64 }
+                        reason: { type: string }
+                required: [submitted_ids, skipped]
+              example:
+                submitted_ids: [9001, 9002, 9003]
+                skipped: []
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # MOOD
+  # ============================================================
+  /v1/mood/entries:
+    post:
+      tags: [Mood]
+      summary: Record today's mood (required at tray clock-in)
+      description: |
+        Once per local-date per user. Returns 409 if today's mood already exists.
+        Score is 1..5 (happy-face). `local_date` is computed by the server from the
+        requester's IANA TZ.
+      operationId: recordMood
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordMoodRequest' }
+            example:
+              score: 4
+      responses:
+        '201':
+          description: Mood recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoodEntry' }
+              example:
+                id: 5012
+                user_id: 18
+                local_date: 2026-05-22
+                score: 4
+                created_at: 2026-05-22T06:02:00+00:00
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Already recorded for today.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: VALIDATION_FAILED
+                message: Mood for 2026-05-22 already exists.
+
+  /v1/mood/me:
+    get:
+      tags: [Mood]
+      summary: Own mood history
+      description: |
+        Returns the requester's mood entries (own only — no other role can see another user's
+        raw mood). Aggregates older than 90 days are unavailable here; use `/v1/mood/org/aggregate`.
+      operationId: getOwnMoodHistory
+      parameters:
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Mood history.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/MoodEntry' }
+                required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/mood/team/aggregate:
+    get:
+      tags: [Mood]
+      summary: Aggregated mood for the manager's team (k>=5 enforced)
+      description: |
+        Manager-scoped aggregate. Returns 400 `K_ANONYMITY_THRESHOLD` if fewer than 5 distinct
+        users contributed to any requested bin. Raw individual mood is NEVER returned by any
+        endpoint other than `/v1/mood/me`.
+      operationId: getTeamMoodAggregate
+      parameters:
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+          required: true
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+          required: true
+        - in: query
+          name: project_id
+          schema: { type: integer, format: int64 }
+          description: Optional anchor restriction.
+      responses:
+        '200':
+          description: Aggregated mood.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/MoodAggregate' }
+                  scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                required: [data, scope_meta]
+        '400':
+          description: K-anonymity threshold not met.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: K_ANONYMITY_THRESHOLD
+                message: Aggregate has fewer than 5 contributing users; cannot return.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/mood/org/aggregate:
+    get:
+      tags: [Mood]
+      summary: Org-wide aggregated mood (Admin/FinMgr only)
+      operationId: getOrgMoodAggregate
+      parameters:
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+          required: true
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+          required: true
+      responses:
+        '200':
+          description: Aggregated mood org-wide.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/MoodAggregate' }
+                required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ============================================================
+  # SCHEDULES
+  # ============================================================
+  /v1/schedules/me:
+    get:
+      tags: [Schedules]
+      summary: Requester's schedule template + applicable overrides
+      operationId: getMySchedule
+      responses:
+        '200':
+          description: Schedule.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  template: { $ref: '#/components/schemas/ScheduleTemplate' }
+                  overrides:
+                    type: array
+                    items: { $ref: '#/components/schemas/ScheduleOverride' }
+                required: [template, overrides]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/schedules/users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    get:
+      tags: [Schedules]
+      summary: Get schedule for a user (RBAC-scoped)
+      operationId: getUserSchedule
+      responses:
+        '200':
+          description: Schedule.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  template: { $ref: '#/components/schemas/ScheduleTemplate' }
+                  overrides:
+                    type: array
+                    items: { $ref: '#/components/schemas/ScheduleOverride' }
+                required: [template, overrides]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/schedules/overrides:
+    post:
+      tags: [Schedules]
+      summary: Create a schedule override
+      description: |
+        Manager may create only `scope=user` overrides for users in their RBAC scope.
+        Admin and FinMgr may create user/project/org overrides. Overlapping overrides
+        for the same scope+target return 409.
+      operationId: createScheduleOverride
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateScheduleOverrideRequest' }
+            example:
+              scope: user
+              user_id: 18
+              effective_from: 2026-06-01
+              effective_to: 2026-06-30
+              start_time: '09:00'
+              end_time: '18:00'
+              reason: Support rotation
+      responses:
+        '201':
+          description: Override created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleOverride' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Overlapping override for the same scope+target.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/schedules/overrides/{override_id}:
+    parameters:
+      - in: path
+        name: override_id
+        required: true
+        schema: { type: integer, format: int64 }
+    delete:
+      tags: [Schedules]
+      summary: Delete a schedule override
+      operationId: deleteScheduleOverride
+      responses:
+        '204':
+          description: Override deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/schedules/dashboard:
+    get:
+      tags: [Schedules]
+      summary: Schedule dashboard (Company/Team/Individual tabs)
+      description: |
+        Returns shaded-block scheduled-hours data for the requested tab and date range.
+        `tab=company` allowed for Admin/FinMgr only. `tab=team` returns the RBAC scope.
+        `tab=individual` requires `user_id` and that user must be in the requester's scope.
+      operationId: getScheduleDashboard
+      parameters:
+        - in: query
+          name: tab
+          required: true
+          schema:
+            type: string
+            enum: [company, team, individual]
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+          description: Required when tab=individual.
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+          required: true
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+          required: true
+        - in: query
+          name: group_by
+          schema:
+            type: string
+            enum: [user, project]
+      responses:
+        '200':
+          description: Dashboard data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ScheduleDashboardRow' }
+                  scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                required: [data, scope_meta]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ============================================================
+  # LEAVE
+  # ============================================================
+  /v1/leave/requests:
+    get:
+      tags: [Leave]
+      summary: List leave requests (cursor-paginated, RBAC-scoped)
+      operationId: listLeaveRequests
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/LeaveStatus' }
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Paginated leave requests.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/LeaveRequest' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Leave]
+      summary: Create a leave request (own)
+      description: |
+        Validations: end_date >= start_date; no overlap with own pending/approved leave;
+        start_date >= today (Admin override available via stage-2 endpoints; out of scope here).
+      operationId: createLeaveRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateLeaveRequestRequest' }
+            example:
+              leave_type: annual
+              start_date: 2026-07-01
+              end_date: 2026-07-10
+              note: Family holiday
+      responses:
+        '201':
+          description: Leave request created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeaveRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/leave/requests/{request_id}/approve:
+    parameters:
+      - in: path
+        name: request_id
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Leave]
+      summary: Approve a leave request (Manager/Admin)
+      description: Approver must have the requesting user in their RBAC scope, or be Admin.
+      operationId: approveLeaveRequest
+      responses:
+        '200':
+          description: Approved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeaveRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/leave/requests/{request_id}/reject:
+    parameters:
+      - in: path
+        name: request_id
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Leave]
+      summary: Reject a leave request (Manager/Admin; reason >=10 chars)
+      operationId: rejectLeaveRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RejectLeaveRequestRequest' }
+            example:
+              reason: Coverage conflict with the support rotation that week.
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeaveRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/leave/requests/{request_id}/cancel:
+    parameters:
+      - in: path
+        name: request_id
+        required: true
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [Leave]
+      summary: Cancel own leave request
+      description: Requester only; status must be pending or approved (post-approval cancellation requires manager re-approval; this endpoint files the cancellation request).
+      operationId: cancelLeaveRequest
+      responses:
+        '200':
+          description: Cancelled / cancellation request filed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeaveRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # APPROVALS
+  # ============================================================
+  /v1/approvals/queue:
+    get:
+      tags: [Approvals]
+      summary: Approval inbox (Manager sees stage-1; FinMgr sees stage-2)
+      description: |
+        RBAC-routed. Manager callers see `submitted` entries from anchored users.
+        FinMgr callers see `manager_approved` entries across the org.
+      operationId: getApprovalQueue
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: iso_week
+          schema: { type: string, pattern: '^\d{4}-W\d{2}$' }
+          description: ISO 8601 week id (e.g. `2026-W21`).
+      responses:
+        '200':
+          description: Approval queue.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/TimeEntry' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/approvals/timesheets/manager:
+    post:
+      tags: [Approvals]
+      summary: Stage-1 batch approve/reject (Manager)
+      description: |
+        Batch mutator. Approves or rejects each entry. Reject requires `reason` >=10 chars.
+        The actor must be in the requester's anchored set for each entry (out-of-scope entries
+        return 403). The actor cannot be the same user as the entry's owner (self-approval
+        invariant).
+      operationId: managerApproveBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManagerApprovalBatchRequest' }
+            example:
+              action: approve
+              entry_ids: [9001, 9002, 9003]
+      responses:
+        '200':
+          description: Batch result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalBatchResponse' }
+              example:
+                approved_ids: [9001, 9002]
+                rejected_ids: []
+                skipped:
+                  - entry_id: 9003
+                    reason: Out of scope.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/approvals/timesheets/final:
+    post:
+      tags: [Approvals]
+      summary: Stage-2 batch approve/reject (FinMgr)
+      description: |
+        Final approval. The actor MUST be a different user than the stage-1 approver of each
+        entry (the system reads `time_entry_state_history` to assert this). Reject reason >=10
+        chars. Approved entries become read-only for the owner.
+      operationId: finalApproveBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinalApprovalBatchRequest' }
+            example:
+              action: approve
+              entry_ids: [9001, 9002]
+      responses:
+        '200':
+          description: Batch result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalBatchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Forbidden, e.g. stage-1 ≠ stage-2 invariant violated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: RBAC_FORBIDDEN
+                message: Stage-2 approver must differ from stage-1 approver for entry 9001.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/approvals/admin-unlock/{entry_id}:
+    parameters:
+      - $ref: '#/components/parameters/EntryIdPath'
+    post:
+      tags: [Approvals]
+      summary: Admin unlock (entry → draft) — reason >=20 chars required
+      operationId: adminUnlockEntry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminUnlockRequest' }
+            example:
+              reason: Mis-coded project; finance approved the unlock 2026-05-21 verbally.
+      responses:
+        '200':
+          description: Entry unlocked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimeEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ============================================================
+  # EXCEPTIONS
+  # ============================================================
+  /v1/exceptions:
+    get:
+      tags: [Exceptions]
+      summary: List exceptions (cursor-paginated, RBAC-scoped)
+      operationId: listExceptions
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: exception_type
+          schema: { $ref: '#/components/schemas/ExceptionType' }
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [open, resolved, dismissed]
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: date_from
+          schema: { type: string, format: date }
+        - in: query
+          name: date_to
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Paginated exceptions.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Exception' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/exceptions/{exception_id}/resolve:
+    parameters:
+      - in: path
+        name: exception_id
+        required: true
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [Exceptions]
+      summary: Resolve an exception
+      description: |
+        Employee may resolve own missed-punch (typically by creating the missing entry; this
+        endpoint just flips the status). Manager may resolve exceptions for users in scope.
+        Resolution note optional but recommended.
+      operationId: resolveException
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveExceptionRequest' }
+            example:
+              resolution_note: Added manual entry 9099 to cover the gap.
+      responses:
+        '200':
+          description: Resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exception' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # REPORTS
+  # ============================================================
+  /v1/reports/detailed-activity:
+    post:
+      tags: [Reports]
+      summary: Detailed activity report (paginated rows + scope_meta; cost columns conditional)
+      description: |
+        Returns one row per time entry within the requester's RBAC scope and filter set.
+
+        **Cost-column stripping:** For Manager and Employee callers, the rows omit `cost_rate`,
+        `cost_amount`, `billable_rate`, and `billable_amount` — these fields are not present in
+        the response. For Admin and FinMgr callers, all financial columns are present.
+
+        Pagination is cursor-based; the `next_cursor` value is opaque (do not parse).
+      operationId: getDetailedActivityReport
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DetailedActivityReportRequest' }
+            example:
+              date_from: 2026-05-01
+              date_to: 2026-05-31
+              client_ids: [7]
+              project_ids: [42, 43]
+              billable: true
+      responses:
+        '200':
+          description: Report rows.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/DetailedActivityRow' }
+                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                    required: [data, scope_meta]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/reports/time-rollup:
+    post:
+      tags: [Reports]
+      summary: Rolled-up time report (group-by aggregator)
+      description: |
+        Aggregates time entries by the requested grouping. Group-by options: project, employee,
+        task, client, day, week.
+
+        **Cost-column stripping:** Manager/Employee responses omit `billable_amount`,
+        `cost_amount`, and `margin*`. Admin/FinMgr responses include all aggregate columns.
+      operationId: getTimeRollupReport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TimeRollupReportRequest' }
+            example:
+              date_from: 2026-05-01
+              date_to: 2026-05-31
+              group_by: project
+              project_ids: [42, 43]
+      responses:
+        '200':
+          description: Rollup rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/TimeRollupRow' }
+                  scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+                required: [data, scope_meta]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ============================================================
+  # EXPORTS
+  # ============================================================
+  /v1/exports/excel:
+    post:
+      tags: [Exports]
+      summary: Harvest-compatible Excel export (sync <=100k rows OR async)
+      description: |
+        Initiates a Harvest-compatible XLSX export with the same filter shape as the detailed
+        report. If the estimated row count <= 100000, the response is synchronous: returns 200
+        with `{ download_url, expires_at }` (24h pre-signed Blob URL). If > 100000 rows, the
+        response is async: 202 with `{ job_id, status: "queued" }`. Poll `GET /v1/exports/jobs/{job_id}`.
+
+        **Cost-column stripping:** Manager/Employee exports omit the `Cost Rate` and `Cost Amount`
+        columns server-side (and the related per-row aggregates) — they are not in the file.
+      operationId: createExcelExport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateExportRequest' }
+            example:
+              date_from: 2026-05-01
+              date_to: 2026-05-31
+              project_ids: [42, 43]
+              billable: true
+              include_columns: harvest_default
+      responses:
+        '200':
+          description: Synchronous export ready (<=100k rows).
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportSyncResponse' }
+              example:
+                mode: sync
+                download_url: https://harvooststg.blob.core.windows.net/exports/...
+                expires_at: 2026-05-23T16:00:00+00:00
+                row_count: 9421
+        '202':
+          description: Async export queued (>100k rows).
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportAsyncResponse' }
+              example:
+                mode: async
+                job_id: c1c1...
+                status: queued
+                row_estimate: 320000
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/exports/jobs/{job_id}:
+    parameters:
+      - in: path
+        name: job_id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Exports]
+      summary: Poll async export job status
+      operationId: getExportJob
+      responses:
+        '200':
+          description: Export job status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportJob' }
+              examples:
+                queued:
+                  value:
+                    job_id: c1c1...
+                    status: queued
+                    row_estimate: 320000
+                    submitted_at: 2026-05-22T14:00:00+00:00
+                running:
+                  value:
+                    job_id: c1c1...
+                    status: running
+                    row_estimate: 320000
+                    submitted_at: 2026-05-22T14:00:00+00:00
+                completed:
+                  value:
+                    job_id: c1c1...
+                    status: completed
+                    row_count: 320101
+                    submitted_at: 2026-05-22T14:00:00+00:00
+                    completed_at: 2026-05-22T14:08:00+00:00
+                    download_url: https://harvooststg.blob.core.windows.net/exports/...
+                    expires_at: 2026-05-23T14:08:00+00:00
+                failed:
+                  value:
+                    job_id: c1c1...
+                    status: failed
+                    submitted_at: 2026-05-22T14:00:00+00:00
+                    failed_at: 2026-05-22T14:02:00+00:00
+                    error_detail: Worker timeout
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # CHATBOT
+  # ============================================================
+  /v1/chatbot/capabilities:
+    get:
+      tags: [Chatbot]
+      summary: Report chatbot capabilities (always works even if chatbot disabled)
+      description: |
+        Returns the active LLM provider, model, whether tool calling is supported (and thus
+        whether the chatbot endpoint is enabled), and the list of available tools.
+
+        When `supports_tools=false`, the `POST /v1/chatbot/messages` endpoint will return 503
+        `CHATBOT_DISABLED`. Clients should hide the chatbot panel and surface the documented
+        reason.
+      operationId: getChatbotCapabilities
+      responses:
+        '200':
+          description: Capabilities.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatbotCapabilities' }
+              example:
+                enabled: true
+                provider: openai
+                model: gpt-4o
+                supports_tools: true
+                tools_available:
+                  - get_user_hours
+                  - get_project_hours
+                  - list_my_team
+                  - list_my_projects
+                  - list_exceptions
+                  - project_rollup
+                  - team_rollup
+                  - project_profitability
+                  - get_overtime_summary
+                  - get_mood_aggregate
+                  - summarize_my_week
+                  - lookup_user
+                  - lookup_project
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/chatbot/messages:
+    post:
+      tags: [Chatbot]
+      summary: Send a chatbot message
+      description: |
+        Sends a user message to the LLM. If `conversation_id` is absent, a new conversation is
+        created. If present, the conversation MUST be owned by the requester (else 404 — same
+        response as "not found" to avoid leaking existence).
+
+        The response includes the assistant reply, any tool-call structured data, and token
+        usage. Provider and model are also returned (useful for cost attribution telemetry).
+
+        Failure modes:
+        - 503 `CHATBOT_DISABLED` if the active LLM provider lacks tool calling.
+        - 429 `RATE_LIMITED` if the per-user daily token budget is exhausted OR the 30/min
+          request budget is exceeded.
+        - 503 `LLM_UNAVAILABLE` on provider 5xx / timeout.
+      operationId: sendChatbotMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatbotMessageRequest' }
+            example:
+              conversation_id: 7f9c-a3...
+              message: How many hours did Bob work last week on Atlas?
+      responses:
+        '200':
+          description: Assistant reply.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatbotMessageResponse' }
+              example:
+                conversation_id: 7f9c-a3...
+                reply: |
+                  Bob logged 38.5 hours on Atlas last week (2026-05-12 to 2026-05-18).
+                  The biggest day was Tuesday (9.2h on Reporting).
+                structured_data:
+                  rows:
+                    - day: 2026-05-12
+                      hours: 7.8
+                    - day: 2026-05-13
+                      hours: 9.2
+                  total_hours: 38.5
+                tool_calls:
+                  - name: get_user_hours
+                    arguments:
+                      user_name_or_email: Bob
+                      date_range:
+                        from: 2026-05-12
+                        to: 2026-05-18
+                    result_summary: 5 rows, 38.5 hours total
+                usage:
+                  tokens_in: 612
+                  tokens_out: 187
+                provider: openai
+                model: gpt-4o
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            Conversation_id supplied but not owned by the requester (or not found).
+            Uniform 404 prevents leaking the existence of someone else's conversation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: NOT_FOUND
+                message: Conversation not found.
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429':
+          description: Rate limited (per-min OR per-day token budget).
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                code: RATE_LIMITED
+                message: Daily chatbot token budget exhausted. Resets at 2026-05-23T00:00:00+02:00.
+                details:
+                  budget: 50000
+                  used: 50412
+                  resets_at: 2026-05-23T00:00:00+02:00
+        '503':
+          description: Chatbot disabled (active provider can't tool-call) or LLM unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                disabled:
+                  value:
+                    code: CHATBOT_DISABLED
+                    message: The chatbot requires an LLM provider with tool-calling support. Current configuration. Contact your administrator.
+                    details:
+                      provider: ollama
+                      model: phi3
+                unavailable:
+                  value:
+                    code: LLM_UNAVAILABLE
+                    message: Upstream LLM provider returned 503. Please try again in a moment.
+
+  /v1/chatbot/conversations:
+    get:
+      tags: [Chatbot]
+      summary: List own chatbot conversations (cursor-paginated, strictly own-only)
+      description: |
+        STRICTLY own-only. Even FinMgr and Manager cannot list another user's chatbot
+        conversations via this endpoint; the result is always `user_id = requester_id`.
+        Ordered by `last_message_at` DESC.
+      operationId: listChatbotConversations
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Paginated conversations.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ChatbotConversation' }
+                    required: [data]
+              example:
+                data:
+                  - id: 7f9c-a3...
+                    user_id: 17
+                    started_at: 2026-05-20T09:00:00+00:00
+                    last_message_at: 2026-05-22T13:00:00+00:00
+                    metadata:
+                      client: web
+                      provider: openai
+                      model: gpt-4o
+                next_cursor: null
+                prev_cursor: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/chatbot/conversations/{conversation_id}/messages:
+    parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Chatbot]
+      summary: List messages within own conversation (cursor-paginated, strictly own-only)
+      description: |
+        STRICTLY own-only. Returns 404 (not 403) if `conversation.user_id != requester_id`
+        — uniform 404 prevents leaking the conversation's existence to non-owners.
+        Messages are ordered by `created_at` ASC (chronological).
+      operationId: listChatbotMessages
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Messages.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ChatbotMessage' }
+                    required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # AUDIT LOG
+  # ============================================================
+  /v1/audit-log:
+    get:
+      tags: [AuditLog]
+      summary: List audit log entries (Admin/FinMgr only; cursor-paginated)
+      description: |
+        Append-only audit log. Read-only endpoint; the audit log cannot be edited or deleted
+        via the API (or via the database — Postgres trigger raises on UPDATE/DELETE).
+      operationId: listAuditLog
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: actor_id
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: entity_type
+          schema: { type: string }
+        - in: query
+          name: entity_id
+          schema: { type: string }
+        - in: query
+          name: action
+          schema: { type: string }
+        - in: query
+          name: date_from
+          schema: { type: string, format: date-time }
+        - in: query
+          name: date_to
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Paginated audit log entries.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CursorPaginationMeta'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AuditLogEntry' }
+                    required: [data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Opaque server-issued session token (the API stores sessions in the `sessions` table
+        — the token itself does not encode claims). The `bearerFormat: JWT` annotation here is
+        a convention for OpenAPI tooling; the actual format is opaque (32+ bytes base64url).
+        Issued by `POST /v1/auth/oidc/callback` after a successful Entra ID OIDC handshake.
+
+  parameters:
+    Cursor:
+      in: query
+      name: cursor
+      schema: { type: string }
+      description: Opaque cursor returned by the previous page's `next_cursor`. Omit for the first page.
+    Limit:
+      in: query
+      name: limit
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+      description: Max items per page (1..200, default 50).
+    Page:
+      in: query
+      name: page
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: 1-based page index for offset-paginated collections.
+    PageSize:
+      in: query
+      name: page_size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+      description: Items per page (1..200, default 50).
+    UserIdPath:
+      in: path
+      name: user_id
+      required: true
+      schema: { type: integer, format: int64 }
+    ProjectIdPath:
+      in: path
+      name: project_id
+      required: true
+      schema: { type: integer, format: int64 }
+    EntryIdPath:
+      in: path
+      name: entry_id
+      required: true
+      schema: { type: integer, format: int64 }
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 200
+      description: |
+        Client-supplied unique key (UUIDv7 recommended) that lets the server dedupe retried
+        requests. Server caches `(user_id, key) → response` for 5 minutes. Reuse with a
+        different payload returns 409 `IDEMPOTENCY_CONFLICT`.
+
+  headers:
+    RateLimitLimit:
+      description: Total budget for the current window.
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Remaining budget for the current window.
+      schema: { type: integer }
+    RateLimitReset:
+      description: UTC seconds-since-epoch when the budget resets.
+      schema: { type: integer }
+
+  responses:
+    BadRequest:
+      description: Malformed request (e.g., bad JSON, bad date format).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: VALIDATION_FAILED
+            message: Field `start_at` is not a valid ISO 8601 datetime with offset.
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: VALIDATION_FAILED
+            message: Missing Authorization header.
+    Forbidden:
+      description: |
+        Authenticated but not allowed (RBAC). Out-of-scope drill-downs return this code.
+        Note: chatbot "no data accessible" responses are 200s with a polite text reply,
+        NOT 403s.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: RBAC_FORBIDDEN
+            message: You do not have access to this resource.
+    NotFound:
+      description: Resource not found (or hidden by RBAC; the API does not distinguish).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: NOT_FOUND
+            message: Resource not found.
+    ValidationFailed:
+      description: Request body or query parameters failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: VALIDATION_FAILED
+            message: One or more fields failed validation.
+            details:
+              fields:
+                - field: end_date
+                  error: must be >= start_date
+    RateLimited:
+      description: Too many requests; see X-RateLimit-* headers.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: RATE_LIMITED
+            message: Rate limit exceeded.
+
+  schemas:
+
+    # ---------- Core enums ----------
+    Role:
+      type: string
+      enum: [admin, finmgr, manager, employee]
+      description: |
+        - `admin`: org-administrator.
+        - `finmgr`: financial manager (stage-2 timesheet approver; cost/billable rate writer).
+        - `manager`: scoped first-stage approver.
+        - `employee`: own-data only.
+
+    BillingMode:
+      type: string
+      enum: [hourly, fixed_fee, non_billable]
+
+    TimeEntryStatus:
+      type: string
+      enum: [running, draft, submitted, manager_approved, final_approved, rejected]
+
+    LeaveStatus:
+      type: string
+      enum: [pending, approved, rejected, cancelled]
+
+    LeaveType:
+      type: string
+      enum: [annual, sick, unpaid, other]
+
+    ExceptionType:
+      type: string
+      enum: [MISSED_PUNCH, OVERTIME_DAY, OVERTIME_WEEK, ANOMALY_LOW, ANOMALY_HIGH]
+
+    ErrorCode:
+      type: string
+      enum:
+        - RBAC_FORBIDDEN
+        - ENTRY_LOCKED
+        - CHATBOT_DISABLED
+        - IDEMPOTENCY_CONFLICT
+        - VALIDATION_FAILED
+        - NOT_FOUND
+        - RATE_LIMITED
+        - LLM_UNAVAILABLE
+        - OIDC_FAILURE
+        - K_ANONYMITY_THRESHOLD
+      description: |
+        Canonical machine-readable error codes returned in the `code` field of every error
+        envelope. See API_NOTES.md for the semantic meaning of each code.
+
+    # ---------- Error & pagination ----------
+    ErrorResponse:
+      type: object
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        message:
+          type: string
+          description: Human-readable English explanation. Safe to display to end users.
+        details:
+          description: Optional structured context (e.g., `fields[]` for validation errors).
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: array, items: { type: object, additionalProperties: true } }
+      required: [code, message]
+      examples:
+        - code: ENTRY_LOCKED
+          message: Cannot edit entry — currently in status manager_approved.
+        - code: RBAC_FORBIDDEN
+          message: You do not have access to this resource.
+
+    ScopeMeta:
+      type: object
+      description: |
+        Returned on every RBAC-scoped LIST response so clients can render meaningful
+        empty states ("you have no projects in scope yet — contact your admin").
+      properties:
+        visible_users:
+          type: integer
+          description: Number of users in the requester's cascade scope (sentinel `-1` if Admin/FinMgr unrestricted).
+        visible_projects:
+          type: integer
+      required: [visible_users, visible_projects]
+
+    CursorPaginationMeta:
+      type: object
+      description: Cursor-based pagination metadata. Use `next_cursor` to fetch the next page.
+      properties:
+        next_cursor:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Opaque cursor. `null` when there is no further page.
+        prev_cursor:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+
+    OffsetPaginationMeta:
+      type: object
+      description: Offset-based pagination metadata.
+      properties:
+        page: { type: integer }
+        page_size: { type: integer }
+        total_count: { type: integer }
+      required: [page, page_size, total_count]
+
+    # ---------- Auth ----------
+    OidcLoginRequest:
+      type: object
+      properties:
+        client_kind:
+          type: string
+          enum: [web, tray]
+        redirect_uri: { type: string, format: uri }
+      required: [client_kind, redirect_uri]
+
+    OidcLoginResponse:
+      type: object
+      properties:
+        authorize_url: { type: string, format: uri }
+        state: { type: string }
+      required: [authorize_url, state]
+
+    OidcCallbackRequest:
+      type: object
+      properties:
+        code: { type: string }
+        state: { type: string }
+        code_verifier: { type: string, description: PKCE verifier matching the challenge sent on /login. }
+        client_kind:
+          type: string
+          enum: [web, tray]
+      required: [code, state, code_verifier, client_kind]
+
+    SessionResponse:
+      type: object
+      properties:
+        session_token:
+          type: string
+          description: Opaque bearer token to send in `Authorization: Bearer <...>` on subsequent calls.
+        expires_at: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+      required: [session_token, expires_at, user]
+
+    MeResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
+      required: [user, scope_meta]
+
+    # ---------- Users ----------
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/Role' }
+        timezone:
+          type: string
+          description: IANA timezone string (e.g. `Africa/Johannesburg`).
+        weekly_summary_opt_out: { type: boolean }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, email, display_name, roles, timezone, weekly_summary_opt_out, is_active, created_at, updated_at]
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        display_name: { type: string }
+        timezone: { type: string }
+        weekly_summary_opt_out: { type: boolean }
+        is_active: { type: boolean }
+      minProperties: 1
+
+    AssignRoleRequest:
+      type: object
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+      required: [role]
+
+    # ---------- Clients ----------
+    Client:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, name, is_active, created_at, updated_at]
+
+    CreateClientRequest:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        is_active: { type: boolean, default: true }
+      required: [name]
+
+    UpdateClientRequest:
+      type: object
+      properties:
+        name: { type: string }
+        is_active: { type: boolean }
+      minProperties: 1
+
+    # ---------- Projects ----------
+    Project:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        client_id: { type: integer, format: int64 }
+        code:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Used in the Harvest `Project Code` export column.
+        name: { type: string }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        fixed_fee_amount:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+        currency: { type: string, minLength: 3, maxLength: 3, description: ISO 4217. }
+        hours_budget:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+        department:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, client_id, name, billing_mode, currency, is_active, created_at, updated_at]
+
+    CreateProjectRequest:
+      type: object
+      properties:
+        client_id: { type: integer, format: int64 }
+        code: { type: string, maxLength: 32 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        fixed_fee_amount: { type: number, format: float }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        hours_budget: { type: number, format: float }
+        department: { type: string }
+      required: [client_id, name, billing_mode, currency]
+
+    UpdateProjectRequest:
+      type: object
+      properties:
+        code: { type: string }
+        name: { type: string }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        fixed_fee_amount: { type: number, format: float }
+        currency: { type: string }
+        hours_budget: { type: number, format: float }
+        department: { type: string }
+        is_active: { type: boolean }
+      minProperties: 1
+
+    AddProjectMemberRequest:
+      type: object
+      properties:
+        user_id: { type: integer, format: int64 }
+        joined_at: { type: string, format: date }
+      required: [user_id]
+
+    ProjectMember:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        joined_at: { type: string, format: date }
+        left_at:
+          oneOf:
+            - { type: string, format: date }
+            - { type: 'null' }
+      required: [id, project_id, user_id, joined_at]
+
+    AddProjectManagerRequest:
+      type: object
+      properties:
+        manager_id: { type: integer, format: int64 }
+      required: [manager_id]
+
+    ProjectManagerAnchor:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        manager_id: { type: integer, format: int64 }
+        assigned_at: { type: string, format: date-time }
+      required: [id, project_id, manager_id, assigned_at]
+
+    # ---------- Tasks ----------
+    ProjectTask:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        name: { type: string }
+        is_billable: { type: boolean }
+        is_active: { type: boolean }
+      required: [id, project_id, name, is_billable, is_active]
+
+    CreateProjectTaskRequest:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        is_billable: { type: boolean, default: true }
+      required: [name]
+
+    UpdateProjectTaskRequest:
+      type: object
+      properties:
+        name: { type: string }
+        is_billable: { type: boolean }
+        is_active: { type: boolean }
+      minProperties: 1
+
+    # ---------- Time entries ----------
+    TimeEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        task_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        notes:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        start_at: { type: string, format: date-time }
+        end_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        status: { $ref: '#/components/schemas/TimeEntryStatus' }
+        billable: { type: boolean }
+        mood_score:
+          oneOf:
+            - { type: integer, minimum: 1, maximum: 5 }
+            - { type: 'null' }
+        billable_rate:
+          oneOf:
+            - { type: number, format: float, description: Omitted from response for Manager/Employee callers. }
+            - { type: 'null' }
+        billable_amount:
+          oneOf:
+            - { type: number, format: float, description: Omitted from response for Manager/Employee callers. }
+            - { type: 'null' }
+        cost_rate:
+          oneOf:
+            - { type: number, format: float, description: Omitted from response for Manager/Employee callers. }
+            - { type: 'null' }
+        cost_amount:
+          oneOf:
+            - { type: number, format: float, description: Omitted from response for Manager/Employee callers. }
+            - { type: 'null' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, user_id, project_id, start_at, status, billable, created_at, updated_at]
+
+    CreateTimeEntryRequest:
+      type: object
+      properties:
+        project_id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        notes: { type: string }
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        billable: { type: boolean }
+      required: [project_id, start_at, end_at]
+
+    UpdateTimeEntryRequest:
+      type: object
+      properties:
+        project_id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        notes: { type: string }
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        billable: { type: boolean }
+      minProperties: 1
+
+    StartTimeEntryRequest:
+      type: object
+      properties:
+        project_id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        notes: { type: string }
+        mood_score: { type: integer, minimum: 1, maximum: 5, description: Required when starting from tray morning prompt. }
+        client_started_at:
+          type: string
+          format: date-time
+          description: Optional client-reported wall-clock start (server clamps if >60s ahead of server clock).
+      required: [project_id]
+
+    StopTimeEntryRequest:
+      type: object
+      properties:
+        client_stopped_at: { type: string, format: date-time }
+        notes: { type: string }
+
+    SwitchTimeEntryRequest:
+      type: object
+      properties:
+        new_project_id: { type: integer, format: int64 }
+        new_task_id: { type: integer, format: int64 }
+        new_notes: { type: string }
+        client_switched_at: { type: string, format: date-time }
+      required: [new_project_id]
+
+    SwitchTimeEntryResponse:
+      type: object
+      properties:
+        stopped: { $ref: '#/components/schemas/TimeEntry' }
+        started: { $ref: '#/components/schemas/TimeEntry' }
+      required: [stopped, started]
+
+    SubmitTimeEntryRequest:
+      type: object
+      properties:
+        scope:
+          type: string
+          enum: [entry, week]
+          default: entry
+        iso_week:
+          type: string
+          pattern: '^\d{4}-W\d{2}$'
+          description: Required when scope=week and the requester wants to submit a week other than the entry's own.
+
+    # ---------- Mood ----------
+    MoodEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        local_date: { type: string, format: date }
+        score: { type: integer, minimum: 1, maximum: 5 }
+        created_at: { type: string, format: date-time }
+      required: [id, user_id, local_date, score, created_at]
+
+    RecordMoodRequest:
+      type: object
+      properties:
+        score: { type: integer, minimum: 1, maximum: 5 }
+      required: [score]
+
+    MoodAggregate:
+      type: object
+      description: |
+        Aggregated bin (per ISO week, per team anchor). k>=5 enforced server-side; below
+        threshold the API returns 400 K_ANONYMITY_THRESHOLD instead of a partial result.
+      properties:
+        team_anchor:
+          type: string
+          description: e.g. `proj:42`, `mgr:17`, or `org` for the org-wide bin.
+        iso_year: { type: integer }
+        iso_week: { type: integer }
+        sample_size: { type: integer, minimum: 5 }
+        score_avg: { type: number, format: float }
+        score_stdev:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+      required: [team_anchor, iso_year, iso_week, sample_size, score_avg]
+
+    # ---------- Schedules ----------
+    ScheduleTemplate:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        working_days:
+          type: array
+          items: { type: integer, minimum: 1, maximum: 7 }
+          description: ISO weekday numbers (1=Mon..7=Sun).
+        start_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        end_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        lunch_start_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+        lunch_end_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+      required: [id, user_id, working_days, start_time, end_time]
+
+    ScheduleOverride:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        scope:
+          type: string
+          enum: [user, project, org]
+        user_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        project_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date }
+        start_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+        end_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+        lunch_start_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+        lunch_end_time:
+          oneOf:
+            - { type: string, pattern: '^\d{2}:\d{2}$' }
+            - { type: 'null' }
+        reason:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        created_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+      required: [id, scope, effective_from, effective_to, created_by, created_at]
+
+    CreateScheduleOverrideRequest:
+      type: object
+      properties:
+        scope:
+          type: string
+          enum: [user, project, org]
+        user_id: { type: integer, format: int64 }
+        project_id: { type: integer, format: int64 }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date }
+        start_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        end_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        lunch_start_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        lunch_end_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        reason: { type: string }
+      required: [scope, effective_from, effective_to]
+
+    ScheduleDashboardRow:
+      type: object
+      properties:
+        user_id: { type: integer, format: int64 }
+        user_display_name: { type: string }
+        project_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        local_date: { type: string, format: date }
+        scheduled_start: { type: string, pattern: '^\d{2}:\d{2}$' }
+        scheduled_end: { type: string, pattern: '^\d{2}:\d{2}$' }
+        scheduled_hours: { type: number, format: float }
+        source:
+          type: string
+          enum: [template, user_override, project_override, org_override]
+        override_reason:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+      required: [user_id, user_display_name, local_date, scheduled_start, scheduled_end, scheduled_hours, source]
+
+    # ---------- Leave ----------
+    LeaveRequest:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        leave_type: { $ref: '#/components/schemas/LeaveType' }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+        half_day:
+          oneOf:
+            - { type: string, enum: [am, pm] }
+            - { type: 'null' }
+        note:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        status: { $ref: '#/components/schemas/LeaveStatus' }
+        approved_by:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        approved_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        rejection_reason:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        bamboo_sync_status:
+          type: string
+          enum: [pending, synced, failed, not_applicable]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, user_id, leave_type, start_date, end_date, status, bamboo_sync_status, created_at, updated_at]
+
+    CreateLeaveRequestRequest:
+      type: object
+      properties:
+        leave_type: { $ref: '#/components/schemas/LeaveType' }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+        half_day:
+          type: string
+          enum: [am, pm]
+        note: { type: string }
+      required: [leave_type, start_date, end_date]
+
+    RejectLeaveRequestRequest:
+      type: object
+      properties:
+        reason: { type: string, minLength: 10 }
+      required: [reason]
+
+    # ---------- Approvals ----------
+    ManagerApprovalBatchRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [approve, reject]
+        entry_ids:
+          type: array
+          items: { type: integer, format: int64 }
+          minItems: 1
+        reason: { type: string, description: Required when action=reject. minLength when reject = 10. }
+      required: [action, entry_ids]
+
+    FinalApprovalBatchRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [approve, reject]
+        entry_ids:
+          type: array
+          items: { type: integer, format: int64 }
+          minItems: 1
+        reason: { type: string }
+      required: [action, entry_ids]
+
+    AdminUnlockRequest:
+      type: object
+      properties:
+        reason: { type: string, minLength: 20 }
+      required: [reason]
+
+    ApprovalBatchResponse:
+      type: object
+      properties:
+        approved_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        rejected_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        skipped:
+          type: array
+          items:
+            type: object
+            properties:
+              entry_id: { type: integer, format: int64 }
+              reason: { type: string }
+            required: [entry_id, reason]
+      required: [approved_ids, rejected_ids, skipped]
+
+    # ---------- Exceptions ----------
+    Exception:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        exception_type: { $ref: '#/components/schemas/ExceptionType' }
+        local_date: { type: string, format: date }
+        details:
+          type: object
+          additionalProperties: true
+          description: e.g. `{ observed_hours, threshold, mean, stdev }`.
+        status:
+          type: string
+          enum: [open, resolved, dismissed]
+        resolved_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        resolved_by:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        resolution_note:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        created_at: { type: string, format: date-time }
+      required: [id, user_id, exception_type, local_date, details, status, created_at]
+
+    ResolveExceptionRequest:
+      type: object
+      properties:
+        resolution_note: { type: string }
+
+    # ---------- Reports ----------
+    DetailedActivityReportRequest:
+      type: object
+      properties:
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date }
+        client_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        project_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        task_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        user_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        billable: { type: boolean }
+      required: [date_from, date_to]
+
+    DetailedActivityRow:
+      type: object
+      description: |
+        One row per time entry, schema mirrors Harvest's detailed-time-report XLSX columns.
+        Cost-bearing fields (`cost_rate`, `cost_amount`, `billable_rate`, `billable_amount`) are
+        OMITTED from responses for Manager/Employee callers.
+      properties:
+        date: { type: string, format: date }
+        client: { type: string }
+        project: { type: string }
+        project_code:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        task:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        notes:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        hours: { type: number, format: float }
+        hours_rounded: { type: number, format: float }
+        billable: { type: boolean }
+        invoiced:
+          type: boolean
+          description: Always false in v1 (Invoicing OOS — reserved for v2).
+        approved: { type: boolean }
+        first_name: { type: string }
+        last_name: { type: string }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/Role' }
+        employee: { type: string }
+        billable_rate:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Omitted for Manager/Employee.
+        billable_amount:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Omitted for Manager/Employee.
+        cost_rate:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Omitted for Manager/Employee.
+        cost_amount:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Omitted for Manager/Employee.
+        currency: { type: string }
+        external_reference_url:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        department:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        estimate:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+      required: [date, client, project, hours, hours_rounded, billable, invoiced, approved, first_name, last_name, employee, currency]
+
+    TimeRollupReportRequest:
+      type: object
+      properties:
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date }
+        group_by:
+          type: string
+          enum: [project, employee, task, client, day, week]
+        client_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        project_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        user_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        billable: { type: boolean }
+      required: [date_from, date_to, group_by]
+
+    TimeRollupRow:
+      type: object
+      properties:
+        group_key: { type: string, description: e.g. project name, employee id, ISO week. }
+        hours: { type: number, format: float }
+        billable_hours: { type: number, format: float }
+        non_billable_hours: { type: number, format: float }
+        billable_amount:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Present only for Admin/FinMgr.
+        cost_amount:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Present only for Admin/FinMgr.
+        margin:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Present only for Admin/FinMgr.
+        margin_pct:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Present only for Admin/FinMgr.
+      required: [group_key, hours, billable_hours, non_billable_hours]
+
+    # ---------- Exports ----------
+    CreateExportRequest:
+      type: object
+      description: Same filter shape as the detailed activity report.
+      properties:
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date }
+        client_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        project_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        user_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        billing_mode: { $ref: '#/components/schemas/BillingMode' }
+        billable: { type: boolean }
+        include_columns:
+          type: string
+          enum: [harvest_default, harvest_full]
+          default: harvest_default
+      required: [date_from, date_to]
+
+    ExportSyncResponse:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [sync]
+        download_url:
+          type: string
+          format: uri
+          description: 24h pre-signed Blob Storage URL.
+        expires_at: { type: string, format: date-time }
+        row_count: { type: integer }
+      required: [mode, download_url, expires_at, row_count]
+
+    ExportAsyncResponse:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [async]
+        job_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [queued]
+        row_estimate: { type: integer }
+      required: [mode, job_id, status, row_estimate]
+
+    ExportJob:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [queued, running, completed, failed]
+        submitted_at: { type: string, format: date-time }
+        completed_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        failed_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        row_estimate:
+          oneOf:
+            - { type: integer }
+            - { type: 'null' }
+        row_count:
+          oneOf:
+            - { type: integer }
+            - { type: 'null' }
+        download_url:
+          oneOf:
+            - { type: string, format: uri }
+            - { type: 'null' }
+        expires_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        error_detail:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+      required: [job_id, status, submitted_at]
+
+    # ---------- Chatbot ----------
+    ChatbotCapabilities:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        reason:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: e.g. `tool_calling_not_supported_by_provider`.
+        provider:
+          type: string
+          enum: [openai, anthropic, google, ollama, xai, mock]
+        model: { type: string }
+        supports_tools: { type: boolean }
+        tools_available:
+          type: array
+          items: { type: string }
+      required: [enabled, provider, model, supports_tools, tools_available]
+
+    ChatbotMessageRequest:
+      type: object
+      properties:
+        conversation_id:
+          type: string
+          format: uuid
+          description: Omit to start a new conversation.
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4000
+      required: [message]
+
+    ChatbotMessageResponse:
+      type: object
+      properties:
+        conversation_id: { type: string, format: uuid }
+        reply: { type: string, description: Natural-language assistant reply. }
+        structured_data:
+          description: Optional table/structured payload produced by tool calls.
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: 'null' }
+        tool_calls:
+          type: array
+          items: { $ref: '#/components/schemas/ChatbotToolCall' }
+        usage:
+          type: object
+          properties:
+            tokens_in: { type: integer }
+            tokens_out: { type: integer }
+          required: [tokens_in, tokens_out]
+        provider: { type: string }
+        model: { type: string }
+      required: [conversation_id, reply, tool_calls, usage, provider, model]
+
+    ChatbotToolCall:
+      type: object
+      properties:
+        name:
+          type: string
+          description: One of the tools advertised in `/v1/chatbot/capabilities.tools_available`.
+        arguments:
+          type: object
+          additionalProperties: true
+        result_summary:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+      required: [name, arguments]
+
+    ChatbotConversation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: integer, format: int64 }
+        started_at: { type: string, format: date-time }
+        last_message_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: e.g. `{ client: "web", provider: "openai", model: "gpt-4o" }`.
+      required: [id, user_id, started_at, last_message_at, metadata]
+
+    ChatbotMessage:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        role:
+          type: string
+          enum: [user, assistant, tool]
+        content:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        tool_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        tool_call_id:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        tool_input:
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: 'null' }
+        tool_output:
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: 'null' }
+        tokens_in:
+          oneOf:
+            - { type: integer }
+            - { type: 'null' }
+        tokens_out:
+          oneOf:
+            - { type: integer }
+            - { type: 'null' }
+        created_at: { type: string, format: date-time }
+      required: [id, conversation_id, role, created_at]
+
+    # ---------- Audit log ----------
+    AuditLogEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        actor_id:
+          oneOf:
+            - { type: integer, format: int64 }
+            - { type: 'null' }
+        action:
+          type: string
+          description: e.g. `time_entry.unlock`, `cost_rate.update`, `chatbot.tool_invoke`.
+        entity_type:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        entity_id:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        before:
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: 'null' }
+        after:
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: 'null' }
+        reason:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        row_hash: { type: string, minLength: 64, maxLength: 64 }
+        created_at: { type: string, format: date-time }
+      required: [id, action, row_hash, created_at]
+
+    # ---------- Health ----------
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        version: { type: string }
+        db:
+          type: string
+          enum: [ok, degraded, down, not_configured]
+        redis:
+          type: string
+          enum: [ok, degraded, down, not_configured]
+        llm:
+          type: string
+          enum: [ok, degraded, down, not_configured]
+      required: [status, version, db, llm]
