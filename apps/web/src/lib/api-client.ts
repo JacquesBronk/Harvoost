@@ -23,14 +23,39 @@ export class ApiError extends Error {
   public readonly status: number;
   public readonly code: string;
   public readonly details?: unknown;
+  // INC-003: for 429 responses, the throttler's retry hint in milliseconds.
+  // The NestJS named-bucket throttler emits `Retry-After-auth` (seconds), NOT a
+  // plain `Retry-After` (confirmed live). Consumers (e.g. useCurrentUser's
+  // retryDelay) honor this to back off instead of hammering the bucket.
+  public readonly retryAfterMs?: number;
 
-  constructor(status: number, payload: ApiErrorPayload) {
+  constructor(
+    status: number,
+    payload: ApiErrorPayload,
+    options?: { retryAfterMs?: number },
+  ) {
     super(payload.message);
     this.name = 'ApiError';
     this.status = status;
     this.code = payload.code;
     this.details = payload.details;
+    this.retryAfterMs = options?.retryAfterMs;
   }
+}
+
+/**
+ * INC-003: parse the throttler's retry hint from a 429 response's headers.
+ * The named-bucket NestJS throttler emits `Retry-After-auth: <seconds>` rather
+ * than a plain `Retry-After`, so we read the named header first and fall back
+ * to the standard one. Returns the delay in milliseconds, or undefined if no
+ * usable hint is present.
+ */
+export function parseRetryAfterMs(headers: Headers): number | undefined {
+  const raw = headers.get('Retry-After-auth') ?? headers.get('Retry-After');
+  if (raw == null) return undefined;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.round(seconds * 1000);
 }
 
 export interface RequestOptions {
@@ -114,11 +139,19 @@ export async function apiFetch<T = unknown>(
       payload && typeof payload === 'object'
         ? (payload as Partial<ApiErrorPayload>)
         : undefined;
-    throw new ApiError(response.status, {
-      code: envelope?.code ?? 'UNKNOWN_ERROR',
-      message: envelope?.message ?? `Request failed (${response.status}).`,
-      details: envelope?.details,
-    });
+    throw new ApiError(
+      response.status,
+      {
+        code: envelope?.code ?? 'UNKNOWN_ERROR',
+        message: envelope?.message ?? `Request failed (${response.status}).`,
+        details: envelope?.details,
+      },
+      // INC-003: capture the throttler's retry hint on 429 so callers can back
+      // off instead of looping. Header is `Retry-After-auth` (seconds).
+      response.status === 429
+        ? { retryAfterMs: parseRetryAfterMs(response.headers) }
+        : undefined,
+    );
   }
 
   return payload as T;

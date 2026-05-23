@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Inject, Logger, Post, Query, Req, Res } from '@nestjs/common';
-import { Throttle } from '@nestjs/throttler';
+import { Throttle, SkipThrottle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
 import { randomBytes } from 'node:crypto';
 import { ENV_TOKEN } from '../config/config.module';
@@ -331,6 +331,15 @@ export class AuthController {
   // back to email defensively so the contract is `display_name: string` (never
   // null/undefined); that keeps the web shell simple (it renders display_name
   // directly without a null guard).
+  //
+  // INC-003: /me is hit on every page load/remount. The class-level
+  // @Throttle({ auth: { ttl: 60_000, limit: 5 } }) brute-force bucket (for
+  // oidc/login + oidc/callback) MUST NOT cover /me, or a normal authenticated
+  // session burns the 5-token budget within seconds and starts returning 429.
+  // Skip ONLY the named `auth` bucket here; /me still falls back to the global
+  // 300/60s bucket (app.module.ts). oidc/login + oidc/callback keep the 5/60s
+  // brute-force protection (they are not decorated with @SkipThrottle).
+  @SkipThrottle({ auth: true })
   @Get('me')
   async me(
     @CurrentUser() user: CurrentUserPayload,

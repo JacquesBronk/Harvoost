@@ -35,3 +35,16 @@ Dispatch `debugger` to reproduce in a real browser (Playwright headed via tests/
 
 ## Scope guardrails
 Do NOT rip out the real-Entra-ID-in-production code path (v0.2.0, intentionally fail-closed). Other TODO_INVENTORY items stay deferred to v0.2.0.
+
+## Resolution — status: CLOSED (2026-05-23, commit 23f0311, closes #2)
+Root cause was NOT the reported symptom. The "stays on /login" was a stale cached pre-INC-001 bundle (hard-refresh fixes it); all 5 ranked suspects were refuted with live-browser evidence. The real, deterministic bug was a three-way OIDC contract mismatch breaking the round-trip *after* Keycloak (B1 dead `redirect_uri`; B2 callback path `/v1/auth/callback` vs served `/auth/callback` + realm allowlist; B3 missing `opaque_state_id`). The copy bug was independent/cosmetic.
+
+Fixes shipped (frontend-dev + backend-dev, 2 passes):
+1. **Round-trip:** `OIDC_REDIRECT_URI_WEB`→`/auth/callback` (+ realm.json allowlist), `opaque_state_id` round-tripped via `sessionStorage`, dead client `redirect_uri` dropped.
+2. **Copy:** new public `GET /v1/auth/idp-info` (user chose the endpoint over the env-var default) drives provider-agnostic copy — `OIDC_DISPLAY_NAME`=Keycloak(dev)/Microsoft Entra ID(prod) + discovery issuer.
+3. **Post-login crash (newly surfaced, user-approved in-scope):** `/v1/auth/me` now returns `display_name` (email fallback); `<Avatar>` is null/empty-safe — fixed the `name.trim()` React-error-boundary crash on `/timesheets`.
+4. **Latent footgun:** `NEXT_PUBLIC_WEB_BASE_URL` baked as a Docker build-arg (mirrors INC-001).
+
+Verification: `pnpm test` 404 pass + 1 known pre-existing `RbacScopeService` fail; clean `docker compose up -d --build` (note: Keycloak `KC_DB=dev-file` persists its volume across `down`, so a realm change requires dropping the `harvoost-keycloak-data` volume to re-import — captured for future incidents); live Playwright `chromium-live` 5/5 — alice@harvoost.local & bob land on a fully-rendered `/timesheets`. Real-Entra-in-prod path untouched (fail-closed, v0.2.0).
+
+Follow-ups (NOT done — deferred): contract test asserting web⇄backend OIDC request/response shapes; single-source-of-truth for the callback path; build-time assertion that every browser-consumed `NEXT_PUBLIC_*` is a declared Dockerfile build-arg. See ROOT_CAUSE.md §Prevention.

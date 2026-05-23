@@ -20,7 +20,7 @@ import {
 import { type ReactNode } from 'react';
 import { Avatar, Badge, LoadingSpinner } from '@harvoost/ui';
 import { useScope } from '@/lib/rbac.js';
-import { useCurrentUser } from '@/lib/auth.js';
+import { resolveAuthGate, useCurrentUser } from '@/lib/auth.js';
 import { env } from '@/lib/env.js';
 import { TimerBar } from './TimerBar.js';
 
@@ -85,9 +85,15 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const scope = useScope();
-  const { data: user, isLoading } = useCurrentUser();
+  const { data: user, isLoading, isError } = useCurrentUser();
 
-  if (isLoading) {
+  // INC-003: treat loading AND transient errors (429/5xx/network) as "still
+  // resolving" — keep the spinner so the auth query can back off and recover.
+  // Only a genuine `null` (mapped 401/403) means "not signed in"; dropping the
+  // shell on a transient error is what fed the redirect → remount → refetch storm.
+  const decision = resolveAuthGate({ user, isLoading, isError });
+
+  if (decision.kind === 'wait') {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <LoadingSpinner size="lg" label="Loading Harvoost" />
@@ -95,14 +101,18 @@ export function AppShell({ children }: { children: ReactNode }) {
     );
   }
 
-  if (!user) {
+  if (decision.kind === 'login') {
     // Not signed in — render children directly (login flow handles its own layout).
     return <>{children}</>;
   }
 
+  const { user: currentUser } = decision;
+
   // INC-002 defense-in-depth: backend guarantees a non-empty display_name, but
   // fall back to the email so the shell can never render a blank identity.
-  const displayName = user.display_name?.trim() ? user.display_name : user.email;
+  const displayName = currentUser.display_name?.trim()
+    ? currentUser.display_name
+    : currentUser.email;
 
   async function handleSignOut() {
     try {
@@ -175,11 +185,13 @@ export function AppShell({ children }: { children: ReactNode }) {
               <div className="truncate text-sm font-medium text-neutral-900">
                 {displayName}
               </div>
-              <div className="truncate text-xs text-neutral-500">{user.email}</div>
+              <div className="truncate text-xs text-neutral-500">
+                {currentUser.email}
+              </div>
             </div>
           </div>
           <div className="mt-2 flex flex-wrap gap-1">
-            {user.roles.map((r) => (
+            {currentUser.roles.map((r) => (
               <Badge key={r} tone="neutral" className="capitalize">
                 {r}
               </Badge>
