@@ -3785,6 +3785,19 @@ components:
           oneOf:
             - { type: integer, format: int64 }
             - { type: 'null' }
+        project_name:
+          type: string
+          description: Project display name (joined from projects). Present on list/running responses; absent on start/switch responses.
+        task_name:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: Task display name, or null when the entry has no task. Present on list/running responses.
+        hours:
+          oneOf:
+            - { type: number, format: float }
+            - { type: 'null' }
+          description: Computed duration in hours (end_at − start_at); null while the entry is running. Present on list responses.
         notes:
           oneOf:
             - { type: string }
