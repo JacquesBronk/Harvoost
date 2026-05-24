@@ -15,11 +15,13 @@ import {
   useToast,
 } from '@harvoost/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, ChevronRight, Send } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, Send } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { PageHeader } from '@/components/PageHeader.js';
 import { ErrorBlock } from '@/components/ErrorBlock.js';
+import { StartTimerControl } from '@/components/StartTimerControl.js';
+import { NewEntryForm } from '@/components/NewEntryForm.js';
 import { apiFetch, describeError } from '@/lib/api-client.js';
 import type { Paginated, TimeEntry } from '@/lib/api-types.js';
 import { formatHours, isoWeekRange, viewerTimeZone } from '@/lib/tz.js';
@@ -33,6 +35,7 @@ export default function TimesheetsPage() {
   const zone = user?.timezone ?? viewerTimeZone();
 
   const [anchorIso, setAnchorIso] = useState(() => DateTime.now().setZone(zone).toISO());
+  const [newEntryOpen, setNewEntryOpen] = useState(false);
   const week = useMemo(() => isoWeekRange(anchorIso ?? '', zone), [anchorIso, zone]);
 
   const entriesQuery = useQuery({
@@ -114,6 +117,14 @@ export default function TimesheetsPage() {
               Next
             </Button>
             <Button
+              variant="secondary"
+              size="sm"
+              iconLeft={<Plus className="h-3.5 w-3.5" aria-hidden="true" />}
+              onClick={() => setNewEntryOpen(true)}
+            >
+              New entry
+            </Button>
+            <Button
               variant="primary"
               size="sm"
               iconLeft={<Send className="h-3.5 w-3.5" aria-hidden="true" />}
@@ -126,6 +137,12 @@ export default function TimesheetsPage() {
           </>
         }
       />
+
+      <Card title="Start a timer" className="mb-4">
+        <StartTimerControl mode="start" layout="inline" />
+      </Card>
+
+      <NewEntryForm open={newEntryOpen} onOpenChange={setNewEntryOpen} zone={zone} />
 
       <Card
         title={week.weekLabel}

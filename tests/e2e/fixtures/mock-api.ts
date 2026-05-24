@@ -516,12 +516,72 @@ function routeRequest(
     const running = Array.from(state.entries.values()).find(
       (e) => e.user_id === state.actor.id && e.status === 'running',
     );
+    // FEAT-001 (GitHub #5): the live controller returns the `{ data }` envelope
+    // (data = the running entry or null), and the web app reconciled to read
+    // `data.data` (TimerBar.tsx / time-entries.ts). The old `{ running, ... }`
+    // shape resolved to `undefined` under the new FE read, so a running entry
+    // never surfaced in the bar. Mirror the live envelope here so the hermetic
+    // TimerBar render assertions (clock-in.spec.ts) match the production read.
     return {
       status: 200,
       body: {
-        running: running ?? null,
-        today_total_hours: hoursTodayFor(state, state.actor.id),
-        server_time: new Date().toISOString(),
+        data: running ?? null,
+      },
+    };
+  }
+  // Projects list — picker source for the FEAT-001 start/switch/manual controls
+  // (StartTimerControl + NewEntryForm call GET /v1/projects?is_active=true and
+  // read the OffsetPaginated `{ data, page, page_size }` envelope; ids are
+  // strings). RBAC-scoped to the actor's visible projects so the picker only
+  // offers projects they can actually clock into.
+  if (path === '/v1/projects' && method === 'GET') {
+    const visible = visibleProjectIds(state.actor.key);
+    const data = Object.values(PROJECTS)
+      .filter((p) => visible.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        code: p.code,
+        client_id: '1',
+        client_name: 'Demo Client Ltd',
+        billing_mode: p.billingMode,
+        is_active: true,
+      }));
+    return {
+      status: 200,
+      body: {
+        data,
+        page: Number(query.get('page') ?? 1),
+        page_size: Number(query.get('page_size') ?? 100),
+        total_count: data.length,
+      },
+    };
+  }
+  // Project tasks — OPTIONAL picker (FEAT-001 / gate (a) #1). The live read
+  // endpoint GET /v1/projects/{project_id}/tasks returns `{ data: ProjectTask[] }`
+  // with string ids; the seed gives every project a "General" task. The picker
+  // degrades gracefully to "No tasks" on an empty list, so the exact contents
+  // are not load-bearing — we return a single "General" task to mirror the seed.
+  const projectTasksMatch = /^\/v1\/projects\/([^/]+)\/tasks$/.exec(path);
+  if (projectTasksMatch && method === 'GET') {
+    const projectId = projectTasksMatch[1]!;
+    const visible = visibleProjectIds(state.actor.key);
+    if (!visible.has(projectId)) {
+      // Not in scope → empty list (the picker shows "No tasks", start still works).
+      return { status: 200, body: { data: [] } };
+    }
+    return {
+      status: 200,
+      body: {
+        data: [
+          {
+            id: `${projectId}-task-general`,
+            project_id: projectId,
+            name: 'General',
+            is_billable: true,
+            is_active: true,
+          },
+        ],
       },
     };
   }

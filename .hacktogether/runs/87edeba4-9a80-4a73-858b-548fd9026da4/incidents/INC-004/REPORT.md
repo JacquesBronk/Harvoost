@@ -56,3 +56,19 @@ Dispatch `debugger` to reproduce all five failures live (authenticated curl + a 
 ## HITL gates
 - **(a)** After the debugger confirms root cause + presents fix-direction options, before dispatching the fix.
 - **(b)** Before pushing the commit. Commit + push to main (closes #4) only after gate (b).
+
+## Resolution — status: CLOSED (2026-05-23, commit 9580827, closes #4)
+All 5 mismatches CONFIRMED live by the debugger, then fixed across backend + frontend + spec. The debugger flipped two audit assumptions: Row 3 (`schedules/dashboard`) was already in the spec → the BACKEND was the drifted side (implement = spec-conformant), and Rows 1-2 had deeper envelope/field drift (`items`/`project_name`/`hours`) beyond the param mismatch. A latent 6th mismatch (override POST Zod shape) was fixed alongside Row 3.
+
+Gate (a) — user chose: implement both rate controllers + contract test in-scope. Three parallel lanes (backend-dev/frontend-dev/api-designer) anchored on HOTFIX_PLAN.md as the pinned contract delivered: R1/R2 param+envelope+field alignment (profitability stays Admin/FinMgr); R3 `GET /v1/schedules/dashboard` (spec-conformant, RBAC company/team/individual); R6 override POST realigned; R4/R5 `CostRatesController`+`BillableRatesController` over existing tables (no migration); `@harvoost/contract` FE↔BE drift guard.
+
+During verify, the new contract test caught (a) 2 pre-existing YAML syntax errors in `openapi.yaml` (unquoted `description`s with embedded colons — fixed) and (b) a SEPARATE pre-existing drift cluster: Admin › Projects (list/remove members+managers) + Admin › Clients (delete), 5 endpoints the FE called but the backend never implemented. **User approved expanding scope** to fix them: `GET/DELETE /v1/projects/{id}/members`, `GET/DELETE /v1/projects/{id}/managers`, `DELETE /v1/clients/{id}` — Admin-only, audited, member-delete soft (left_at), client-delete FK-guarded (23503 → clean 4xx). Live verification then surfaced a pre-existing High BigInt-serialization 500 on the `GET /v1/users` / `/v1/projects` / `/v1/clients` list endpoints (raw `$queryRaw` bigint rows), blocking the admin tables from rendering; **user approved fixing it** via a process-wide `BigInt.prototype.toJSON` serializer in `apps/api/src/main.ts`.
+
+Verification: `pnpm test` 610 pass + 1 known pre-existing `RbacScopeService` fail; `@harvoost/contract` 122/122; clean `docker compose up -d --build`; live Playwright `chromium-live` (`tests/e2e/specs/admin-pages-load.spec.ts`) 2/2 — all 6 page-areas load real data without 400/404 (team-dashboard, profitability [+manager gated out cleanly], schedules/dashboard, cost/billable-rates, projects members/managers add+remove, clients create/delete + FK-guard), and the BigInt list endpoints now return 200. No INC-001/002/003 regression (sign-in + no `/me` storm reconfirmed live). Real-Entra-in-prod path untouched; login/callback throttle intact; `.github/` left untracked.
+
+**Acceptance criteria met:** (1) all four named pages + the two expanded admin pages load real data without 400/404 (live); (2) the contract test fails on FE↔BE drift (in place, green); (3) `pnpm test` green; (4) CHANGELOG `[Unreleased]/Fixed` entry (4 bullets, #4).
+
+**Follow-ups (NOT done — deferred, documented in the contract test allowlists / e2e handoff):**
+- `POST /v1/time-entries/{id}/submit` is a latent 404 (`KNOWN_ROUTE_GAP`) — "Submit week" from `/timesheets`; relates to the timesheet flow / #5 area.
+- Report rollup drill-ins (`GET /v1/reports/{employees,projects}/{id}/rollup`) registered but not yet in the spec (`KNOWN_SPEC_GAP`).
+- The hermetic e2e mocked-project env artifact (reuses the prod web build instead of `next dev`) and the 2 pre-existing `csrf.spec.ts` Finding-8 failures — unrelated to #4, tracked under the v0.2.0 e2e-suite item.

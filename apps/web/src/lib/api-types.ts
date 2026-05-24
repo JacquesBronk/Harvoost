@@ -61,10 +61,54 @@ export interface TimeEntry {
   user_timezone?: string;
 }
 
+/**
+ * FEAT-001: `GET /v1/time-entries/running` returns `{ data: <entry> | null }`
+ * (time-entries.controller.ts:148) — a single `{ data }` envelope, NOT the old
+ * `{ running, today_total_hours, server_time }` shape this type used to claim.
+ * Reading `.running` against the live backend always yielded `undefined`, so a
+ * started timer never surfaced in `TimerBar`. Consumers must read `data.data`.
+ * `today_total_hours` is NOT returned by the live endpoint; it is computed from
+ * the week list where shown.
+ */
 export interface RunningTimerSnapshot {
-  running: TimeEntry | null;
-  today_total_hours: number;
-  server_time: string;
+  data: TimeEntry | null;
+}
+
+/**
+ * FEAT-001: request body for `POST /v1/time-entries/start`.
+ * Header `Idempotency-Key` is REQUIRED (attach via newIdempotencyKey()).
+ * Returns the new entry UNWRAPPED (no `{ data }`).
+ */
+export interface StartTimerRequest {
+  project_id: string;
+  task_id?: string;
+  notes?: string;
+}
+
+/**
+ * FEAT-001: request body for `POST /v1/time-entries/switch`.
+ * The LIVE controller validates `project_id` (SwitchSchema,
+ * time-entries.controller.ts:34) — NOT the spec's `new_project_id`.
+ * Header `Idempotency-Key` is REQUIRED. Returns the entry UNWRAPPED.
+ */
+export interface SwitchTimerRequest {
+  project_id: string;
+  task_id?: string;
+  notes?: string;
+}
+
+/**
+ * FEAT-001: request body for `POST /v1/time-entries` (manual create).
+ * This route neither reads nor requires an `Idempotency-Key` header
+ * (time-entries.controller.ts:300) — do NOT attach one. Datetimes are
+ * ISO-8601 with the viewer's offset. Returns the entry UNWRAPPED (status `draft`).
+ */
+export interface CreateManualEntryRequest {
+  project_id: string;
+  task_id?: string;
+  start_at: string;
+  end_at: string;
+  notes?: string;
 }
 
 export interface Project {

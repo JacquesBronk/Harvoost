@@ -4,7 +4,7 @@ import { Roles } from '../common/roles.decorator';
 import { CurrentUser, type CurrentUserPayload } from '../common/current-user.decorator';
 import { ZodValidationPipe } from '../common/dto/zod-validation.pipe';
 import { PrismaService } from '../prisma/prisma.service';
-import { NotFoundError, RbacScopeService } from '@harvoost/shared';
+import { NotFoundError, RbacScopeService, ValidationFailedError } from '@harvoost/shared';
 import { RBAC_SCOPE_SERVICE } from '../rbac/rbac.module';
 import { AuditService } from '../common/audit/audit.service';
 
@@ -57,6 +57,64 @@ export class ProjectsController {
     );
     if (rows.length === 0) throw new NotFoundError();
     return rows[0];
+  }
+
+  // GET /v1/projects/{project_id}/tasks → { data: ProjectTask[] }.
+  // Read-only list of tasks within a project (FEAT-001 task picker source).
+  // RBAC: project-visibility scoped via RbacScopeService — admin/finmgr see all,
+  // others only see projects they're anchored to. A project the requester cannot
+  // see (or that does not exist) returns 404, never 403, so existence never leaks.
+  // Optional `is_active` (boolean) narrows on project_tasks.is_active when present.
+  // bigint ids (id, project_id) are String()-mapped so the wire shape is unambiguous.
+  @Get(':project_id/tasks')
+  async listTasks(
+    @CurrentUser() user: CurrentUserPayload,
+    @Param('project_id') projectId: string,
+    @Query('is_active') isActive?: string,
+  ) {
+    // Visibility gate: scoped requesters may only list tasks for a project they
+    // can see; non-visible/non-existent both collapse to 404 (no existence leak).
+    const visible = await this.rbac.getVisibleProjectIds(user.userId);
+    if (!visible.unrestricted && !visible.projectIds.includes(projectId)) {
+      throw new NotFoundError();
+    }
+
+    // Confirm the project actually exists (covers admin/finmgr unrestricted path
+    // and a stale id for a scoped user); a missing project is a 404, not [].
+    const projectRows = await this.prisma.$queryRawUnsafe<Array<{ id: unknown }>>(
+      `SELECT id FROM projects WHERE id = $1::bigint LIMIT 1`,
+      projectId,
+    );
+    if (projectRows.length === 0) throw new NotFoundError();
+
+    // Parse the optional is_active filter. Absent → no filter (all tasks).
+    // Anything other than the boolean literals is a clear validation failure.
+    const params: unknown[] = [projectId];
+    let where = `project_id = $1::bigint`;
+    if (isActive !== undefined) {
+      let flag: boolean;
+      if (isActive === 'true') flag = true;
+      else if (isActive === 'false') flag = false;
+      else throw new ValidationFailedError('is_active must be a boolean.');
+      params.push(flag);
+      where += ` AND is_active = $${params.length}::boolean`;
+    }
+
+    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
+      `SELECT id, project_id, name, is_billable, is_active
+       FROM project_tasks WHERE ${where} ORDER BY name ASC, id ASC`,
+      ...params,
+    );
+
+    return {
+      data: rows.map((r) => ({
+        id: String(r.id),
+        project_id: String(r.project_id),
+        name: String(r.name),
+        is_billable: Boolean(r.is_billable),
+        is_active: Boolean(r.is_active),
+      })),
+    };
   }
 
   @Roles('admin')

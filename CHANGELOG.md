@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Time tracking is now operable from the web app: start, switch, stop, and manually log time entries directly from `/timesheets` ([#5](https://github.com/JacquesBronk/Harvoost/issues/5)). Core clock-in (REQUIREMENTS F1/F2) was previously unreachable in the browser — `TimerBar` could only *stop* a running timer and showed a dead "Start one from timesheets" link that pointed back to a page with no start control.
+  - **Start a timer** from a project picker (with an optional task picker + notes), surfaced both inline on `/timesheets` and in the global `TimerBar` (replacing the dead link). Backed by `POST /v1/time-entries/start` with an `Idempotency-Key`; a single shared `startTimer` path drives both render sites.
+  - **Optional task selection + notes** on start / switch / manual entries. The task picker is populated by the newly-implemented read-only `GET /v1/projects/{project_id}/tasks` (RBAC project-scoped — the operation was declared in `openapi.yaml` but had no controller and 404'd at runtime). Selection is optional, so clock-in still works on a project with no tasks defined.
+  - **New manual entry** form (project + optional task + start / end + notes) via `POST /v1/time-entries`, with client-side validation (end after start, ≤ 24h) and back- and future-dating allowed (the server's no-overlap guard remains the protection); the new `draft` entry appears in the week list.
+  - **Switch project without stopping** from the running `TimerBar` via `POST /v1/time-entries/switch` (atomically closes the current entry and opens a new `running` one); when a timer is already running, the Start control offers Switch instead of failing with a 409.
+  - Reconciled two latent frontend read bugs this feature made load-bearing: the `GET /v1/time-entries/running` `{ data }` envelope (`TimerBar` had been reading a non-existent `.running` field, so a started timer never surfaced) and the `switch` request field name (`project_id`, matching the live controller, not the spec's `new_project_id`). Also fixed a latent `task_id` bind in the start / switch / manual `INSERT`s that lacked a `::bigint` cast — newly reachable via the task picker — which made selecting a task return `500` (`42804`).
+  - Verified live (Playwright `chromium-live`): signed in as Alice, started / switched / stopped a timer and created a manual entry from `/timesheets`, with `GET /v1/time-entries/running` and the week list reflecting each step and the chosen `task_id` persisted. Guarded by new frontend wiring tests, a backend integration test, and the `@harvoost/contract` suite (now 131 checks).
+
 ### Fixed
 
 - Web app no longer hangs on an infinite loader at `http://localhost:3000/` against the full docker-compose stack ([#1](https://github.com/JacquesBronk/Harvoost/issues/1)). The static CSP `script-src 'self' 'wasm-unsafe-eval'` in `apps/web/next.config.mjs` was blocking Next.js 14's inline RSC flight-payload scripts, so `ClientPageRoot` never hydrated and the SSR'd `LoadingSpinner` was terminal. Replaced with a per-request nonce strategy via new `apps/web/middleware.ts` (CSP set on both request and response headers, nonce auto-propagated to Next.js's inline scripts), and `app/layout.tsx` now calls `headers()` to opt the route tree into dynamic rendering so the nonce is in scope at render time.
@@ -35,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ML-based anomaly detection upgrade (current implementation is rule-based 2σ over trailing 4 weeks).
 - Multi-currency reporting with live FX (deferred to v2).
 - BambooHR live leave-sync provider (the seam is in place; v1 ships the NoOp implementation).
+- Period / timesheet approval locking — reject creating or back-dating time entries into an already-approved period ([#6](https://github.com/JacquesBronk/Harvoost/issues/6)). FEAT-001 ([#5](https://github.com/JacquesBronk/Harvoost/issues/5)) currently allows free back- and future-dating, protected only by the per-entry no-overlap guard; approval state is per-entry and there is no period-level lock yet.
 
 ## [0.1.0] — 2026-05-23
 

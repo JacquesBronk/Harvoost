@@ -172,7 +172,7 @@ export class TimeEntriesController {
         );
         const rows = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
           `INSERT INTO time_entries (user_id, project_id, task_id, notes, start_at, status, billable, mood_score, idempotency_key)
-           VALUES ($1::bigint, $2::bigint, $3, $4, NOW(), 'running', TRUE, $5, $6)
+           VALUES ($1::bigint, $2::bigint, $3::bigint, $4, NOW(), 'running', TRUE, $5, $6)
            RETURNING id, user_id, project_id, task_id, notes, start_at, end_at, status, billable, mood_score`,
           user.userId,
           body.project_id,
@@ -253,7 +253,7 @@ export class TimeEntriesController {
         );
         const rows = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
           `INSERT INTO time_entries (user_id, project_id, task_id, notes, start_at, status, billable, idempotency_key)
-           VALUES ($1::bigint, $2::bigint, $3, $4, NOW(), 'running', TRUE, $5)
+           VALUES ($1::bigint, $2::bigint, $3::bigint, $4, NOW(), 'running', TRUE, $5)
            RETURNING id, user_id, project_id, task_id, notes, start_at, end_at, status, billable`,
           user.userId,
           body.project_id,
@@ -321,7 +321,7 @@ export class TimeEntriesController {
     if (overlap.length > 0) throw new ValidationFailedError('Overlapping time entry exists');
     const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
       `INSERT INTO time_entries (user_id, project_id, task_id, notes, start_at, end_at, status, billable)
-       VALUES ($1::bigint, $2::bigint, $3, $4, $5::timestamptz, $6::timestamptz, 'draft', COALESCE($7, TRUE))
+       VALUES ($1::bigint, $2::bigint, $3::bigint, $4, $5::timestamptz, $6::timestamptz, 'draft', COALESCE($7, TRUE))
        RETURNING id, user_id, project_id, task_id, notes, start_at, end_at, status, billable`,
       user.userId,
       body.project_id,
