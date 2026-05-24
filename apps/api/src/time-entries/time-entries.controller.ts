@@ -139,8 +139,12 @@ export class TimeEntriesController {
     params.push(q.limit);
     const limitIdx = params.length;
     const sql = `
-      SELECT te.id, te.user_id, te.project_id, te.task_id, te.notes, te.start_at, te.end_at, te.status, te.billable
+      SELECT te.id, te.user_id, te.project_id, p.name AS project_name,
+             te.task_id, pt.name AS task_name,
+             te.notes, te.start_at, te.end_at, te.status, te.billable
       FROM time_entries te
+      JOIN projects p ON p.id = te.project_id
+      LEFT JOIN project_tasks pt ON pt.id = te.task_id
       WHERE ${wheres.join(' AND ')}
       ORDER BY te.start_at DESC
       LIMIT $${limitIdx}::int`;
@@ -159,9 +163,13 @@ export class TimeEntriesController {
   @Get('running')
   async running(@CurrentUser() user: CurrentUserPayload) {
     const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT id, user_id, project_id, task_id, notes, start_at, end_at, status, billable
-       FROM time_entries
-       WHERE user_id = $1::bigint AND status = 'running'
+      `SELECT te.id, te.user_id, te.project_id, p.name AS project_name,
+              te.task_id, pt.name AS task_name,
+              te.notes, te.start_at, te.end_at, te.status, te.billable
+       FROM time_entries te
+       JOIN projects p ON p.id = te.project_id
+       LEFT JOIN project_tasks pt ON pt.id = te.task_id
+       WHERE te.user_id = $1::bigint AND te.status = 'running'
        LIMIT 1`,
       user.userId,
     );

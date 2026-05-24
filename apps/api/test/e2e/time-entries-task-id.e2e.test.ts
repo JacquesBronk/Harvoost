@@ -44,6 +44,22 @@ const { PrismaClient } = require('@prisma/client');
 const DB_URL =
   process.env.DATABASE_URL ?? 'postgresql://harvoost:dev@localhost:5432/harvoost?sslmode=disable';
 
+// The seeded dev DB does not pre-create `idempotency_keys` (the IdempotencyService creates it
+// lazily via the same `CREATE TABLE IF NOT EXISTS` on first lookup/store). The cleanup DELETEs
+// below run BEFORE any service call, so we create it defensively here — mirroring the service's
+// own DDL in src/common/idempotency/idempotency.service.ts — so the cleanup never 42P01s.
+const ENSURE_IDEMPOTENCY_TABLE = `
+  CREATE TABLE IF NOT EXISTS idempotency_keys (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    response JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, idempotency_key)
+  );
+`;
+
 // Seeded fixture: carol (user 7) is an employee + member of project 1, whose
 // "General" task is id 1 (see packages/db/prisma/seed.ts).
 const TEST_USER_ID = '7';
@@ -56,11 +72,13 @@ const EMPLOYEE: CurrentUserPayload = {
   roles: ['employee'],
 };
 
-// start/switch/createManual never touch RBAC; a no-op stub matches the unit-test fixture.
+// start/switch/createManual never touch RBAC; list() additionally calls withSelfScope. The stub
+// scopes visibility to the test user + project so list() returns only this fixture's rows.
 function makeRbac(): RbacScopeService {
   return {
     getVisibleUserIds: async () => ({ userIds: [TEST_USER_ID], meta: { fromProjects: 0, fromPersons: 0 }, unrestricted: false }),
     getVisibleProjectIds: async () => ({ projectIds: [TEST_PROJECT_ID], meta: { fromProjects: 0, fromPersons: 0 }, unrestricted: false }),
+    withSelfScope: (userId: string) => ({ userIds: [userId], selfOnly: true }),
   } as unknown as RbacScopeService;
 }
 
@@ -98,6 +116,9 @@ describe('time-entries non-null task_id (FEAT-001 regression, GitHub #5) — rea
     ctrl = new TimeEntriesController(prisma, idem, makeRbac(), noopAudit, noopSync, periods);
 
     if (dbReady) {
+      // Ensure the lazily-created idempotency table exists so the cleanup DELETE below
+      // (which runs before any service call) does not 42P01 on the seeded dev DB.
+      await prisma.$executeRawUnsafe(ENSURE_IDEMPOTENCY_TABLE);
       // Clean slate: drop any existing entries + idempotency keys for the test user
       // so the one-running-per-user index and overlap GIST don't surface as 409s.
       await prisma.$executeRawUnsafe(`DELETE FROM time_entries WHERE user_id = $1::bigint`, TEST_USER_ID);
@@ -187,5 +208,137 @@ describe('time-entries non-null task_id (FEAT-001 regression, GitHub #5) — rea
     );
     expect(persisted).toHaveLength(1);
     expect(String(persisted[0].task_id)).toBe(TEST_TASK_ID);
+  });
+});
+
+// INC-009 (GitHub #21) — the time-entries READ endpoints (list + running) must return
+// project_name (INNER join to projects) and task_name (LEFT join to project_tasks). The web
+// week table / TimerBar render `entry.project_name`/`entry.task_name` with fallbacks; before
+// the JOINs were added these were never sent, so the UI showed `Project #<id>` and `—`.
+// This drives the controller against the seeded DB and asserts the names are present, and that
+// task_name is null when an entry has no task while project_name stays populated.
+describe('time-entries read endpoints return project_name/task_name (INC-009, #21) — real DB', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let prisma: any;
+  let ctrl: TimeEntriesController;
+  let dbReady = false;
+  let seededProjectName: string | null = null;
+  let seededTaskName: string | null = null;
+
+  beforeAll(async () => {
+    prisma = new PrismaClient({ datasources: { db: { url: DB_URL } } });
+    try {
+      await prisma.$connect();
+      const rows = await prisma.$queryRawUnsafe(
+        `SELECT 1 AS ok FROM project_tasks
+         WHERE id = $1::bigint AND project_id = $2::bigint AND is_active = TRUE`,
+        TEST_TASK_ID,
+        TEST_PROJECT_ID,
+      );
+      dbReady = Array.isArray(rows) && rows.length > 0;
+    } catch {
+      dbReady = false;
+    }
+
+    const idem = new IdempotencyService(prisma);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const periods = new PeriodService(prisma as any);
+    ctrl = new TimeEntriesController(prisma, idem, makeRbac(), noopAudit, noopSync, periods);
+
+    if (dbReady) {
+      // Resolve the seeded project + task names so the assertions compare against the real
+      // values rather than hard-coding seed strings.
+      const projRows = await prisma.$queryRawUnsafe(
+        `SELECT name FROM projects WHERE id = $1::bigint`,
+        TEST_PROJECT_ID,
+      );
+      seededProjectName = projRows.length > 0 ? String(projRows[0].name) : null;
+      const taskRows = await prisma.$queryRawUnsafe(
+        `SELECT name FROM project_tasks WHERE id = $1::bigint`,
+        TEST_TASK_ID,
+      );
+      seededTaskName = taskRows.length > 0 ? String(taskRows[0].name) : null;
+
+      await prisma.$executeRawUnsafe(ENSURE_IDEMPOTENCY_TABLE);
+      await prisma.$executeRawUnsafe(`DELETE FROM time_entries WHERE user_id = $1::bigint`, TEST_USER_ID);
+      await prisma.$executeRawUnsafe(`DELETE FROM idempotency_keys WHERE user_id = $1::bigint`, TEST_USER_ID);
+    }
+  });
+
+  afterEach(async () => {
+    if (dbReady) {
+      await prisma.$executeRawUnsafe(`DELETE FROM time_entries WHERE user_id = $1::bigint`, TEST_USER_ID);
+      await prisma.$executeRawUnsafe(`DELETE FROM idempotency_keys WHERE user_id = $1::bigint`, TEST_USER_ID);
+    }
+  });
+
+  afterAll(async () => {
+    await prisma?.$disconnect?.();
+  });
+
+  it('seeded task 1 is "General"', () => {
+    if (!dbReady) {
+      console.warn('[skip] seeded project_tasks fixture not reachable — skipping name fixture case');
+      return;
+    }
+    expect(seededTaskName).toBe('General');
+    expect(seededProjectName).toBeTruthy();
+  });
+
+  it('running() returns project_name + task_name after a start with a task', async () => {
+    if (!dbReady) {
+      console.warn('[skip] seeded project_tasks fixture not reachable — skipping running-with-task case');
+      return;
+    }
+    await ctrl.start(EMPLOYEE, randomUUID(), {
+      project_id: TEST_PROJECT_ID,
+      task_id: TEST_TASK_ID,
+    });
+
+    const res = await ctrl.running(EMPLOYEE);
+    const data = res.data as Record<string, unknown> | null;
+    expect(data).not.toBeNull();
+    expect(data!.project_name).toBe(seededProjectName);
+    expect(data!.task_name).toBe('General');
+  });
+
+  it('list() running row carries project_name + task_name', async () => {
+    if (!dbReady) {
+      console.warn('[skip] seeded project_tasks fixture not reachable — skipping list-with-task case');
+      return;
+    }
+    await ctrl.start(EMPLOYEE, randomUUID(), {
+      project_id: TEST_PROJECT_ID,
+      task_id: TEST_TASK_ID,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = await ctrl.list(EMPLOYEE, { limit: 50 } as any);
+    const rows = res.data as Array<Record<string, unknown>>;
+    const running = rows.find((r) => r.status === 'running');
+    expect(running).toBeDefined();
+    expect(running!.project_name).toBe(seededProjectName);
+    expect(running!.task_name).toBe('General');
+  });
+
+  it('task_name is null when started with no task, project_name still populated', async () => {
+    if (!dbReady) {
+      console.warn('[skip] seeded project_tasks fixture not reachable — skipping no-task case');
+      return;
+    }
+    await ctrl.start(EMPLOYEE, randomUUID(), { project_id: TEST_PROJECT_ID });
+
+    const res = await ctrl.running(EMPLOYEE);
+    const data = res.data as Record<string, unknown> | null;
+    expect(data).not.toBeNull();
+    expect(data!.task_name).toBeNull();
+    expect(data!.project_name).toBe(seededProjectName);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const listRes = await ctrl.list(EMPLOYEE, { limit: 50 } as any);
+    const running = (listRes.data as Array<Record<string, unknown>>).find((r) => r.status === 'running');
+    expect(running).toBeDefined();
+    expect(running!.task_name).toBeNull();
+    expect(running!.project_name).toBe(seededProjectName);
   });
 });
