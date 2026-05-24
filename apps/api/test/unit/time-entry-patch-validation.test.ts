@@ -58,6 +58,16 @@ function makeSyncStub() {
   return { emit: vi.fn(), subscribe: vi.fn(), subscriberCount: vi.fn(() => 0) };
 }
 
+// FEAT-002: PeriodService stub — always writable, no-op recompute.
+function makePeriodsStub() {
+  return {
+    getUserTz: vi.fn(async () => 'Africa/Johannesburg'),
+    resolveWeek: vi.fn(async () => ({ isoYear: 2026, isoWeek: 18, weekStartDate: '2026-04-27' })),
+    assertPeriodWritable: vi.fn(async () => undefined),
+    recomputePeriod: vi.fn(async () => undefined),
+  };
+}
+
 const actor = { userId: '10', email: 'e@e', roles: ['employee'] };
 
 describe('TimeEntriesController.edit — strict schema + RBAC', () => {
@@ -65,7 +75,7 @@ describe('TimeEntriesController.edit — strict schema + RBAC', () => {
     const prisma = makePrismaStub();
     const rbac = makeRbacStub(true);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any);
+    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any, makePeriodsStub() as any);
     await expect(ctrl.edit(actor, '1', { malicious_field: 'evil' })).rejects.toBeInstanceOf(ZodError);
   });
 
@@ -73,7 +83,7 @@ describe('TimeEntriesController.edit — strict schema + RBAC', () => {
     const prisma = makePrismaStub();
     const rbac = makeRbacStub(true);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any);
+    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any, makePeriodsStub() as any);
     await expect(ctrl.edit(actor, '1', { project_id: '../../etc/passwd' })).rejects.toBeInstanceOf(ZodError);
   });
 
@@ -81,7 +91,7 @@ describe('TimeEntriesController.edit — strict schema + RBAC', () => {
     const prisma = makePrismaStub();
     const rbac = makeRbacStub(false);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any);
+    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any, makePeriodsStub() as any);
     // body.project_id (200) differs from existing (100) → RBAC check fires.
     await expect(ctrl.edit(actor, '1', { project_id: '200' })).rejects.toBeInstanceOf(RbacForbiddenError);
     expect(rbac.assertCanSeeProject).toHaveBeenCalledWith(actor.userId, '200');
@@ -92,7 +102,7 @@ describe('TimeEntriesController.edit — strict schema + RBAC', () => {
     const rbac = makeRbacStub(true);
     const audit = makeAuditStub();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, audit as any, makeSyncStub() as any);
+    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, audit as any, makeSyncStub() as any, makePeriodsStub() as any);
     const out = await ctrl.edit(actor, '1', { notes: 'updated note' });
     expect(out).toEqual({ ok: true });
     expect(rbac.assertCanSeeProject).not.toHaveBeenCalled();
@@ -106,7 +116,7 @@ describe('TimeEntriesController.edit — strict schema + RBAC', () => {
     const prisma = makePrismaStub({ existing: { user_id: '99' } });
     const rbac = makeRbacStub(true);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any);
+    const ctrl = new TimeEntriesController(prisma as any, makeIdemStub() as any, rbac as any, makeAuditStub() as any, makeSyncStub() as any, makePeriodsStub() as any);
     await expect(ctrl.edit(actor, '1', { notes: 'x' })).rejects.toBeInstanceOf(NotFoundError);
   });
 });

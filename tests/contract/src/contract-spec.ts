@@ -25,6 +25,23 @@
 // NOTE: keys are stored with `{param}` because loadSpec()/scan-frontend both
 // normalise every path interpolation to `{param}` (see normaliseSpecPath).
 //
+// FEAT-002 (issue #6) extends the same mechanism to the period/timesheet locking
+// surface (Option F). Three new operations are now spec'd + routed:
+//   - POST /v1/time-entries/{param}/submit — the week-submit route the FE already
+//     calls (it was the INC-004 KNOWN_ROUTE_GAP; the route is now REGISTERED, so
+//     it moves OUT of KNOWN_ROUTE_GAP and INTO LOAD_BEARING). The 200 body is the
+//     submit result object `{ submitted_ids, skipped }` (NOT an envelope), so
+//     shape 'object' + empty envelopeKey resolves its own top-level props.
+//   - GET /v1/timesheet-periods/{param} — the self period read backing the FE
+//     "week submitted/locked" banner. The 200 body is a single TimesheetPeriod
+//     object (the open-shell variant omits `id` / nulls `week_start_date`), so
+//     shape 'object' + empty envelopeKey resolves the period's own props. `reads`
+//     are the load-bearing fields the banner consumes (status + the per-status
+//     entry_counts rollup).
+//   - GET /v1/timesheet-periods — the list (self + RBAC-visible). 200 body is
+//     `{ data: TimesheetPeriod[] }`, so shape 'paginated-data' + envelopeKey
+//     'data' resolves the per-row period schema.
+//
 // Three allowlists carry pre-existing, OUT-OF-SCOPE debt on endpoints the
 // INC-004 lanes are NOT touching, so the suite stays green for the hotfix while
 // still flagging the debt in the log. NEW drift on any other endpoint still
@@ -150,6 +167,44 @@ export const LOAD_BEARING: EnvelopeExpectation[] = [
     shape: 'object',
     reads: ['project', 'total_hours', 'billable_hours', 'hours_by_member'],
   },
+  {
+    // FEAT-002 (issue #6): POST /v1/time-entries/{entry_id}/submit. The route is
+    // now REGISTERED (it was the INC-004 KNOWN_ROUTE_GAP, removed below). The 200
+    // body is the submit-result object `{ submitted_ids, skipped }` (NOT an
+    // envelope), so shape 'object' + empty envelopeKey resolves its own props.
+    // `reads` are the two top-level fields the result carries; FAILS the build if
+    // the spec ever drops one. This entry also re-asserts the route is routed,
+    // which is the assertion that flips the moment the gap entry is removed.
+    key: 'POST /v1/time-entries/{param}/submit',
+    envelopeKey: '',
+    shape: 'object',
+    reads: ['submitted_ids', 'skipped'],
+  },
+  {
+    // FEAT-002 (issue #6): GET /v1/timesheet-periods/{iso_week} — the self period
+    // read backing the FE "week submitted/locked" banner. The 200 body is a
+    // single TimesheetPeriod object (the open-shell variant omits `id` and nulls
+    // `week_start_date`; modelled as one object schema with those optional/
+    // nullable rather than a oneOf so the row-prop resolver sees the full field
+    // set). shape 'object' + empty envelopeKey resolves the period's own props.
+    // `reads` are the load-bearing fields the banner consumes: the period status
+    // and the per-status entry_counts rollup.
+    key: 'GET /v1/timesheet-periods/{param}',
+    envelopeKey: '',
+    shape: 'object',
+    reads: ['user_id', 'iso_year', 'iso_week', 'status', 'entry_counts'],
+  },
+  {
+    // FEAT-002 (issue #6): GET /v1/timesheet-periods — the list (self +
+    // RBAC-visible). The 200 body is `{ data: TimesheetPeriod[] }`, so shape
+    // 'paginated-data' + envelopeKey 'data' resolves the per-row period schema
+    // (note: this list envelope has no offset-pagination meta, but the resolver
+    // only needs the `data` array key, which is present).
+    key: 'GET /v1/timesheet-periods',
+    envelopeKey: 'data',
+    shape: 'paginated-data',
+    reads: ['id', 'user_id', 'iso_year', 'iso_week', 'status', 'entry_counts'],
+  },
 ];
 
 /**
@@ -185,11 +240,12 @@ export const KNOWN_SPEC_GAP: string[] = [];
  * route, OUTSIDE the INC-004 pinned contract (no HOTFIX_PLAN row). Genuine
  * latent 404s a future incident should fix; allowlisted so the INC-004 suite
  * stays green while the debt stays visible in the log.
+ *
+ * FEAT-002 (issue #6) CLOSED the last entry here: POST /v1/time-entries/{id}/submit
+ * is now a REGISTERED route (`@Post(':id/submit')` on the time-entries
+ * controller), so it has been removed from this list and promoted into
+ * LOAD_BEARING above (declared + routed + read-field asserted). The array is now
+ * empty: there is no remaining FE-consumed endpoint with a latent-404 spec/route
+ * mismatch.
  */
-export const KNOWN_ROUTE_GAP: string[] = [
-  // timesheets/page.tsx submits a week via POST /v1/time-entries/{id}/submit.
-  // Spec declares /v1/time-entries/{entry_id}/submit, but the time-entries
-  // controller registers no `:id/submit` route (only PATCH/DELETE :id). Latent
-  // 404 the moment a user clicks "Submit week"; out of INC-004 scope.
-  'POST /v1/time-entries/{param}/submit',
-];
+export const KNOWN_ROUTE_GAP: string[] = [];

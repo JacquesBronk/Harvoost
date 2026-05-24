@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { TimeEntriesController } from '../../src/time-entries/time-entries.controller';
 import { IdempotencyService } from '../../src/common/idempotency/idempotency.service';
+import { PeriodService } from '../../src/timesheet-periods/period.service';
 import type { RbacScopeService } from '@harvoost/shared';
 import type { CurrentUserPayload } from '../../src/common/current-user.decorator';
 
@@ -92,7 +93,9 @@ describe('time-entries non-null task_id (FEAT-001 regression, GitHub #5) — rea
     }
 
     const idem = new IdempotencyService(prisma);
-    ctrl = new TimeEntriesController(prisma, idem, makeRbac(), noopAudit, noopSync);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const periods = new PeriodService(prisma as any);
+    ctrl = new TimeEntriesController(prisma, idem, makeRbac(), noopAudit, noopSync, periods);
 
     if (dbReady) {
       // Clean slate: drop any existing entries + idempotency keys for the test user

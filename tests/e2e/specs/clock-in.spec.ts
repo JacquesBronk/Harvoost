@@ -94,13 +94,14 @@ test.describe('Journey 3: submit week + lock enforcement', () => {
   test('submitting transitions draft entries to submitted', async ({ page }) => {
     const handle = await signInAs(page, { actorKey: 'bob', seedSampleEntries: true });
     await page.getByRole('button', { name: /submit week/i }).click();
-    // Toast appears, week status badges flip. The Radix Toast renders its title
-    // BOTH as a visible <Title> node AND inside a screen-reader aria-live
-    // announcement ("Notification Week submitted…"), so a loose /week submitted/i
-    // match trips strict mode (two nodes). Anchor on the exact visible title text
-    // so we assert the one visible toast title. (Pre-existing Radix announcement
-    // duplication — unrelated to FEAT-001.)
-    await expect(page.getByText('Week submitted', { exact: true })).toBeVisible();
+    // FEAT-002 (GitHub #6): the submit flow now consumes the real
+    // { submitted_ids, skipped } shape and summarizeSubmitResult() titles the
+    // success toast "Submitted N entries" (was "Week submitted" pre-FEAT-002).
+    // The Radix Toast renders its title BOTH as a visible <Title> node AND inside
+    // a screen-reader aria-live announcement, so a loose match trips strict mode
+    // (two nodes); we anchor on `.first()` to assert the one visible toast title.
+    // seedSampleEntries gives Bob 3 draft entries → "Submitted 3 entries".
+    await expect(page.getByText(/^Submitted \d+ entries$/).first()).toBeVisible();
     // Reload to ensure the new state survives a refetch.
     await page.reload();
     const states = Array.from(handle.state.entries.values())

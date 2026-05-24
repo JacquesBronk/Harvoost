@@ -52,6 +52,15 @@ info:
     and `X-RateLimit-Reset` headers. Chatbot has both a request-rate cap (30/min) and a per-user
     daily token budget (default 50000 tokens, configurable in `org_settings`).
 
+    ## Period locking (FEAT-002, issue #6)
+    A `timesheet_period` row is the lock oracle for a (user, ISO-week). Submitting a week
+    (`POST /v1/time-entries/{entry_id}/submit` with `scope=week`) creates/advances it and
+    flips that week's draft entries to `submitted`. Once a period is in a locked status
+    (`submitted`, `manager_approved`, or `final_approved`), any write whose `start_at` lands
+    in that week — create, PATCH-move, start, switch, or delete — is rejected with
+    `409 PERIOD_LOCKED`. An admin reopens a week via
+    `POST /v1/timesheet-periods/{user_id}/{iso_week}/unlock`.
+
     ## Versioning
     Path-based: `/v1`. When `/v2` ships, `/v1` remains available for at least 6 months;
     deprecation surfaced via `Sunset` and `Deprecation` HTTP response headers.
@@ -80,6 +89,8 @@ tags:
     description: Project sub-categories.
   - name: TimeEntries
     description: Core time tracking — manual entries, timer start/stop/switch, weekly submission.
+  - name: TimesheetPeriods
+    description: Per-user, per-ISO-week timesheet period lifecycle + lock oracle (FEAT-002, issue #6).
   - name: Mood
     description: Daily mood capture and manager-aggregate views with k>=5 anonymity.
   - name: Schedules
@@ -1013,7 +1024,9 @@ paths:
       description: |
         Creates a time entry for the requester. `start_at` and `end_at` must both be set;
         `end_at > start_at`; duration <= 24h; no overlap with any other entry of the same user.
-        On overlap or running-timer conflict, returns 409.
+        On overlap or running-timer conflict, returns 409. If the entry's `start_at` lands in a
+        locked timesheet period (the week is `submitted`/`manager_approved`/`final_approved`),
+        the create is rejected with 409 `PERIOD_LOCKED` (FEAT-002).
       operationId: createTimeEntry
       requestBody:
         required: true
@@ -1036,13 +1049,25 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
-          description: Overlapping entry or running-timer conflict.
+          description: |
+            - Overlapping entry or running-timer conflict (`VALIDATION_FAILED`).
+            - The entry's `start_at` lands in a locked timesheet period (`PERIOD_LOCKED`, FEAT-002).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
-              example:
-                code: VALIDATION_FAILED
-                message: Entry overlaps with another entry [9001] for the same user.
+              examples:
+                overlap:
+                  value:
+                    code: VALIDATION_FAILED
+                    message: Entry overlaps with another entry [9001] for the same user.
+                period_locked:
+                  value:
+                    code: PERIOD_LOCKED
+                    message: Cannot write into week 2026-W21 — it is submitted and locked.
+                    details:
+                      iso_year: 2026
+                      iso_week: 21
+                      status: submitted
         '422': { $ref: '#/components/responses/ValidationFailed' }
 
   /v1/time-entries/running:
@@ -1095,6 +1120,10 @@ paths:
         The `Idempotency-Key` header is REQUIRED. Retried requests with the same key + same
         payload return the original response. Reuse with a different payload returns 409
         `IDEMPOTENCY_CONFLICT`.
+
+        FEAT-002: if the new timer's `start_at` (server `NOW()`) lands in a locked timesheet
+        period — possible when the user submitted the in-progress week early — the start is
+        rejected with 409 `PERIOD_LOCKED`.
       operationId: startTimeEntry
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1121,6 +1150,7 @@ paths:
           description: |
             - A different running timer already exists for the requester (use `/switch`).
             - The same `Idempotency-Key` was used with a different payload → `IDEMPOTENCY_CONFLICT`.
+            - `NOW()` lands in a locked timesheet period → `PERIOD_LOCKED` (FEAT-002).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -1133,6 +1163,14 @@ paths:
                   value:
                     code: IDEMPOTENCY_CONFLICT
                     message: Idempotency-Key reused with a different payload.
+                period_locked:
+                  value:
+                    code: PERIOD_LOCKED
+                    message: Cannot write into week 2026-W21 — it is submitted and locked.
+                    details:
+                      iso_year: 2026
+                      iso_week: 21
+                      status: submitted
         '422': { $ref: '#/components/responses/ValidationFailed' }
 
   /v1/time-entries/stop:
@@ -1181,6 +1219,9 @@ paths:
       description: |
         Stops the current running entry and starts a new one in a single transaction (no gap,
         no overlap). The `Idempotency-Key` header is REQUIRED.
+
+        FEAT-002: if the new entry's `start_at` (server `NOW()`) lands in a locked timesheet
+        period, the switch is rejected with 409 `PERIOD_LOCKED` (same defensive check as start).
       operationId: switchTimeEntry
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1212,10 +1253,25 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
-          description: No timer running OR Idempotency-Key conflict.
+          description: |
+            - No timer running OR Idempotency-Key conflict.
+            - `NOW()` lands in a locked timesheet period → `PERIOD_LOCKED` (FEAT-002).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                no_timer_or_conflict:
+                  value:
+                    code: VALIDATION_FAILED
+                    message: No timer running, or Idempotency-Key conflict.
+                period_locked:
+                  value:
+                    code: PERIOD_LOCKED
+                    message: Cannot write into week 2026-W21 — it is submitted and locked.
+                    details:
+                      iso_year: 2026
+                      iso_week: 21
+                      status: submitted
         '422': { $ref: '#/components/responses/ValidationFailed' }
 
   /v1/time-entries/{entry_id}:
@@ -1228,6 +1284,11 @@ paths:
         Editable only when status is `draft` or `rejected`. Entries with status `submitted`,
         `manager_approved`, or `final_approved` return 409 `ENTRY_LOCKED`. Admin unlock is a
         separate endpoint (`POST /v1/approvals/admin-unlock/{entry_id}`).
+
+        FEAT-002: when the edit moves `start_at` (or `end_at`) into a DIFFERENT, locked week,
+        the destination-period check returns 409 `PERIOD_LOCKED`. The entry's own-status
+        `ENTRY_LOCKED` check fires first, so a `submitted` entry yields `ENTRY_LOCKED` while a
+        `draft`/`rejected` entry moved into a locked week yields `PERIOD_LOCKED`.
       operationId: updateTimeEntry
       requestBody:
         required: true
@@ -1249,18 +1310,34 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Entry locked by approval state.
+          description: |
+            - Entry locked by its OWN approval state (`ENTRY_LOCKED`).
+            - The new `start_at` moves the entry into a locked week (`PERIOD_LOCKED`, FEAT-002).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
-              example:
-                code: ENTRY_LOCKED
-                message: Cannot edit entry — currently in status manager_approved.
+              examples:
+                entry_locked:
+                  value:
+                    code: ENTRY_LOCKED
+                    message: Cannot edit entry — currently in status manager_approved.
+                period_locked:
+                  value:
+                    code: PERIOD_LOCKED
+                    message: Cannot write into week 2026-W21 — it is submitted and locked.
+                    details:
+                      iso_year: 2026
+                      iso_week: 21
+                      status: submitted
         '422': { $ref: '#/components/responses/ValidationFailed' }
     delete:
       tags: [TimeEntries]
       summary: Delete a time entry (soft delete)
-      description: Same lock rules as PATCH; locked entries return 409 `ENTRY_LOCKED`.
+      description: |
+        Same own-status lock rules as PATCH; locked entries return 409 `ENTRY_LOCKED`.
+        FEAT-002 (APPROVED hardening): deleting an entry whose `start_at` lands in a locked
+        week is also rejected with 409 `PERIOD_LOCKED` — the own-status `ENTRY_LOCKED` check
+        fires first, then the destination-period check.
       operationId: deleteTimeEntry
       responses:
         '204':
@@ -1269,10 +1346,25 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Entry locked.
+          description: |
+            - Entry locked by its OWN approval state (`ENTRY_LOCKED`).
+            - The entry's `start_at` lands in a locked week (`PERIOD_LOCKED`, FEAT-002 hardening).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                entry_locked:
+                  value:
+                    code: ENTRY_LOCKED
+                    message: Cannot delete entry — currently in status manager_approved.
+                period_locked:
+                  value:
+                    code: PERIOD_LOCKED
+                    message: Cannot write into week 2026-W21 — it is submitted and locked.
+                    details:
+                      iso_year: 2026
+                      iso_week: 21
+                      status: submitted
 
   /v1/time-entries/{entry_id}/submit:
     parameters:
@@ -1281,20 +1373,42 @@ paths:
       tags: [TimeEntries]
       summary: Submit a draft entry (or its whole week) for stage-1 approval
       description: |
-        Convenience operation. With `scope=entry` the single entry transitions draft → submitted.
-        With `scope=week` all draft entries in the same ISO week (in the requester's TZ) submit
-        atomically. Locked entries are skipped.
+        Self-only (the `entry_id` must belong to the caller, else 404). With `scope=entry` the
+        single anchor entry transitions draft → submitted. With `scope=week` all draft entries
+        in the same ISO week (in the requester's TZ) submit atomically; the optional `iso_week`
+        body field (`YYYY-Www`) overrides the anchor entry's own week. The FE sends
+        `{ "scope": "week" }`.
+
+        Entries that cannot be submitted are reported in `skipped` (never an error): a `running`
+        entry is skipped with `reason: running`; an already-`submitted`/`manager_approved`/
+        `final_approved` entry is skipped with `reason: already_submitted`. Submitting creates /
+        advances the `timesheet_period` row for the week (this is what LOCKS it), so submit
+        itself is never `PERIOD_LOCKED`.
       operationId: submitTimeEntry
       requestBody:
         required: false
         content:
           application/json:
             schema: { $ref: '#/components/schemas/SubmitTimeEntryRequest' }
-            example:
-              scope: week
+            examples:
+              week:
+                summary: Submit the whole week the anchor entry belongs to (what the FE sends).
+                value:
+                  scope: week
+              week_override:
+                summary: Submit a specific ISO week, overriding the anchor entry's week.
+                value:
+                  scope: week
+                  iso_week: 2026-W21
+              entry:
+                summary: Submit just the single anchor entry.
+                value:
+                  scope: entry
       responses:
         '200':
-          description: Submitted entries.
+          description: |
+            Submitted entries (`submitted_ids`) plus the entries that were skipped and why.
+            IDs are string-encoded bigints.
           content:
             application/json:
               schema:
@@ -1302,21 +1416,194 @@ paths:
                 properties:
                   submitted_ids:
                     type: array
-                    items: { type: integer, format: int64 }
+                    items: { type: string }
+                    description: String-encoded bigint ids of the entries flipped draft → submitted.
                   skipped:
                     type: array
                     items:
                       type: object
                       properties:
-                        entry_id: { type: integer, format: int64 }
-                        reason: { type: string }
+                        entry_id: { type: string }
+                        reason:
+                          type: string
+                          enum: [running, already_submitted]
+                      required: [entry_id, reason]
                 required: [submitted_ids, skipped]
               example:
-                submitted_ids: [9001, 9002, 9003]
-                skipped: []
+                submitted_ids: ['10', '11']
+                skipped:
+                  - entry_id: '12'
+                    reason: running
+                  - entry_id: '13'
+                    reason: already_submitted
+        '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  # ============================================================
+  # TIMESHEET PERIODS (FEAT-002, issue #6)
+  # ============================================================
+  /v1/timesheet-periods:
+    get:
+      tags: [TimesheetPeriods]
+      summary: List timesheet periods (self + RBAC-visible)
+      description: |
+        Returns the persisted timesheet-period rollup rows visible to the caller, newest first
+        (`iso_year DESC, iso_week DESC`). With no `user_id`, the result is the caller's RBAC
+        cascade scope (self always included). `user_id` restricts to one user (must be
+        RBAC-visible — self always passes; out-of-scope → 403). Open weeks with no submitted
+        entries have no row and therefore do not appear here (use the single GET for the
+        synthesized open shell).
+      operationId: listTimesheetPeriods
+      parameters:
+        - in: query
+          name: user_id
+          schema: { type: integer, format: int64 }
+          description: Restrict to one user's periods (must be RBAC-visible; self always passes).
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/TimesheetPeriodStatus' }
+          description: Filter to a single period status.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: Max periods to return (1..200, default 50).
+      responses:
+        '200':
+          description: Timesheet periods (always with `id` + `entry_counts`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/TimesheetPeriod' }
+                required: [data]
+              example:
+                data:
+                  - id: '7'
+                    user_id: '3'
+                    iso_year: 2026
+                    iso_week: 21
+                    week_start_date: 2026-05-18
+                    status: submitted
+                    submitted_at: 2026-05-22T16:00:00+00:00
+                    submitted_by: '3'
+                    manager_approved_at: null
+                    final_approved_at: null
+                    reopened_at: null
+                    entry_counts:
+                      draft: 0
+                      submitted: 5
+                      manager_approved: 0
+                      final_approved: 0
+                      rejected: 0
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/timesheet-periods/{iso_week}:
+    parameters:
+      - $ref: '#/components/parameters/IsoWeekPath'
+    get:
+      tags: [TimesheetPeriods]
+      summary: Get the caller's own timesheet period for an ISO week
+      description: |
+        Returns the caller's `timesheet_period` for the given ISO week (`YYYY-Www`). A malformed
+        `iso_week` returns 400 `VALIDATION_FAILED`. When a persisted row exists it is returned in
+        full (with `id` and `week_start_date`). When no row exists, the week is implicitly `open`
+        (DESIGN §1) and the API synthesizes an OPEN SHELL: the same field set with `status: open`,
+        `id` OMITTED, `week_start_date: null`, all timestamps `null`, and live `entry_counts`.
+        Backs the FE "week submitted/locked" banner and the Submit-week button enable/disable.
+      operationId: getTimesheetPeriod
+      responses:
+        '200':
+          description: |
+            The caller's period for the week — a persisted row, OR a synthesized open shell when
+            no row exists (`id` omitted, `week_start_date: null`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimesheetPeriod' }
+              examples:
+                persisted:
+                  summary: A submitted (locked) week with a persisted row.
+                  value:
+                    id: '7'
+                    user_id: '3'
+                    iso_year: 2026
+                    iso_week: 21
+                    week_start_date: 2026-05-18
+                    status: submitted
+                    submitted_at: 2026-05-22T16:00:00+00:00
+                    submitted_by: '3'
+                    manager_approved_at: null
+                    final_approved_at: null
+                    reopened_at: null
+                    entry_counts:
+                      draft: 0
+                      submitted: 5
+                      manager_approved: 0
+                      final_approved: 0
+                      rejected: 0
+                open_shell:
+                  summary: An open week with no row yet (id omitted, week_start_date null).
+                  value:
+                    user_id: '3'
+                    iso_year: 2026
+                    iso_week: 22
+                    week_start_date: null
+                    status: open
+                    submitted_at: null
+                    submitted_by: null
+                    manager_approved_at: null
+                    final_approved_at: null
+                    reopened_at: null
+                    entry_counts:
+                      draft: 2
+                      submitted: 0
+                      manager_approved: 0
+                      final_approved: 0
+                      rejected: 0
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/timesheet-periods/{user_id}/{iso_week}/unlock:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+      - $ref: '#/components/parameters/IsoWeekPath'
+    post:
+      tags: [TimesheetPeriods]
+      summary: Admin unlock a whole timesheet week (reason >=20 chars)
+      description: |
+        Admin only (`@Roles('admin')`). Convenience that loops the EXISTING per-entry
+        admin-unlock over every LOCKED entry in the (user, ISO-week): each is dropped to `draft`
+        with a `time_entry_state_history` row preserving `from_status` and an `approval.admin_unlock`
+        audit row — identical to N manual per-entry unlocks, no new authority. The period then
+        recomputes to `open` with `reopened_at` set (D4). Keyed by `(user_id, iso_week)` since a
+        period has no standalone id in the contract.
+      operationId: unlockTimesheetWeek
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnlockTimesheetWeekRequest' }
+            example:
+              reason: Finance approved reopening this week to correct a mis-coded project on 2026-05-22.
+      responses:
+        '200':
+          description: Week unlocked; the entries that were dropped back to draft.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnlockTimesheetWeekResponse' }
+              example:
+                unlocked_ids: ['20', '21']
+                user_id: '3'
+                iso_year: 2026
+                iso_week: 21
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   # ============================================================
   # MOOD
@@ -1809,7 +2096,8 @@ paths:
         Batch mutator. Approves or rejects each entry. Reject requires `reason` >=10 chars.
         The actor must be in the requester's anchored set for each entry (out-of-scope entries
         return 403). The actor cannot be the same user as the entry's owner (self-approval
-        invariant).
+        invariant). FEAT-002: after the batch, each affected period is recomputed in the same
+        transaction (no contract change — the period status follows its entries).
       operationId: managerApproveBatch
       requestBody:
         required: true
@@ -1843,7 +2131,8 @@ paths:
       description: |
         Final approval. The actor MUST be a different user than the stage-1 approver of each
         entry (the system reads `time_entry_state_history` to assert this). Reject reason >=10
-        chars. Approved entries become read-only for the owner.
+        chars. Approved entries become read-only for the owner. FEAT-002: each affected period
+        is recomputed in the same transaction (the stage1≠stage2 invariant is preserved).
       operationId: finalApproveBatch
       requestBody:
         required: true
@@ -1877,6 +2166,11 @@ paths:
     post:
       tags: [Approvals]
       summary: Admin unlock (entry → draft) — reason >=20 chars required
+      description: |
+        Admin only. Drops ONE entry back to `draft` (with history + audit). FEAT-002: the
+        entry's period is recomputed in the same transaction; the moment an entry drops below
+        `submitted` the period reopens to `open` with `reopened_at` set (D4). To reopen a whole
+        week at once, use `POST /v1/timesheet-periods/{user_id}/{iso_week}/unlock`.
       operationId: adminUnlockEntry
       requestBody:
         required: true
@@ -2976,6 +3270,14 @@ components:
       name: entry_id
       required: true
       schema: { type: integer, format: int64 }
+    IsoWeekPath:
+      in: path
+      name: iso_week
+      required: true
+      schema:
+        type: string
+        pattern: '^\d{4}-W\d{2}$'
+      description: ISO 8601 week id in the form `YYYY-Www` (e.g. `2026-W21`). Malformed → 400 `VALIDATION_FAILED`.
     IdempotencyKey:
       in: header
       name: Idempotency-Key
@@ -3048,6 +3350,22 @@ components:
               fields:
                 - field: end_date
                   error: must be >= start_date
+    PeriodLocked:
+      description: |
+        The target ISO-week is a locked timesheet period (`submitted`/`manager_approved`/
+        `final_approved`). Returned by the time-entry write paths (create, PATCH-move, start,
+        switch, delete) when `start_at` lands in such a week (FEAT-002). `details` carries the
+        offending week + status.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            code: PERIOD_LOCKED
+            message: Cannot write into week 2026-W21 — it is submitted and locked.
+            details:
+              iso_year: 2026
+              iso_week: 21
+              status: submitted
     RateLimited:
       description: Too many requests; see X-RateLimit-* headers.
       content:
@@ -3077,6 +3395,14 @@ components:
       type: string
       enum: [running, draft, submitted, manager_approved, final_approved, rejected]
 
+    TimesheetPeriodStatus:
+      type: string
+      enum: [open, submitted, manager_approved, final_approved, rejected]
+      description: |
+        Timesheet-period lifecycle (FEAT-002). Parallels `TimeEntryStatus` minus `running`/`draft`;
+        `open` replaces draft as the editable state. A period is LOCKED (writes into the week are
+        rejected with `PERIOD_LOCKED`) iff status ∈ {submitted, manager_approved, final_approved}.
+
     LeaveStatus:
       type: string
       enum: [pending, approved, rejected, cancelled]
@@ -3094,6 +3420,7 @@ components:
       enum:
         - RBAC_FORBIDDEN
         - ENTRY_LOCKED
+        - PERIOD_LOCKED
         - CHATBOT_DISABLED
         - IDEMPOTENCY_CONFLICT
         - VALIDATION_FAILED
@@ -3104,7 +3431,8 @@ components:
         - K_ANONYMITY_THRESHOLD
       description: |
         Canonical machine-readable error codes returned in the `code` field of every error
-        envelope. See API_NOTES.md for the semantic meaning of each code.
+        envelope. See API_NOTES.md for the semantic meaning of each code. `PERIOD_LOCKED`
+        (FEAT-002) is the 409 returned when a write targets a locked timesheet week.
 
     # ---------- Error & pagination ----------
     ErrorResponse:
@@ -3123,6 +3451,8 @@ components:
       examples:
         - code: ENTRY_LOCKED
           message: Cannot edit entry — currently in status manager_approved.
+        - code: PERIOD_LOCKED
+          message: Cannot write into week 2026-W21 — it is submitted and locked.
         - code: RBAC_FORBIDDEN
           message: You do not have access to this resource.
 
@@ -3530,6 +3860,87 @@ components:
           type: string
           pattern: '^\d{4}-W\d{2}$'
           description: Required when scope=week and the requester wants to submit a week other than the entry's own.
+
+    # ---------- Timesheet periods (FEAT-002) ----------
+    TimesheetPeriod:
+      type: object
+      description: |
+        Per-user, per-ISO-week timesheet period (the lock oracle, FEAT-002). The status is a
+        DERIVED rollup of the user's non-`running` entries in the ISO-week (owner TZ), persisted
+        for indexability + a stable lock check + an audit anchor.
+
+        Returned in two variants by `GET /v1/timesheet-periods/{iso_week}`:
+        - PERSISTED row: all fields present, `id` set, `week_start_date` a date.
+        - OPEN SHELL (no row exists yet): `status: open`, `id` OMITTED, `week_start_date: null`,
+          all timestamps `null`. The list endpoint (`GET /v1/timesheet-periods`) only ever
+          returns persisted rows (always with `id`). IDs are string-encoded bigints.
+      properties:
+        id:
+          type: string
+          description: String-encoded bigint. OMITTED in the synthesized open shell (no row exists yet).
+        user_id: { type: string, description: String-encoded bigint owner id. }
+        iso_year: { type: integer, description: ISO-8601 week-numbering year. }
+        iso_week: { type: integer, minimum: 1, maximum: 53, description: ISO-8601 week number. }
+        week_start_date:
+          oneOf:
+            - { type: string, format: date }
+            - { type: 'null' }
+          description: Monday of the week in the owner's TZ (date). `null` in the open shell (no row yet).
+        status: { $ref: '#/components/schemas/TimesheetPeriodStatus' }
+        submitted_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        submitted_by:
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+          description: String-encoded bigint of the submitting user (the owner in v1), or null.
+        manager_approved_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        final_approved_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+        reopened_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: 'null' }
+          description: Set when an admin-unlock pulls the period back to `open` (D4).
+        entry_counts:
+          type: object
+          description: Live per-status counts of the user's non-running entries in the ISO-week (owner TZ).
+          properties:
+            draft: { type: integer }
+            submitted: { type: integer }
+            manager_approved: { type: integer }
+            final_approved: { type: integer }
+            rejected: { type: integer }
+          required: [draft, submitted, manager_approved, final_approved, rejected]
+      required: [user_id, iso_year, iso_week, status, entry_counts]
+
+    UnlockTimesheetWeekRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 20
+          description: Justification (>=20 chars, same threshold as per-entry admin-unlock). Recorded in audit + history.
+      required: [reason]
+
+    UnlockTimesheetWeekResponse:
+      type: object
+      properties:
+        unlocked_ids:
+          type: array
+          items: { type: string }
+          description: String-encoded bigint ids of the entries dropped back to draft.
+        user_id: { type: string, description: String-encoded bigint owner id. }
+        iso_year: { type: integer }
+        iso_week: { type: integer }
+      required: [unlocked_ids, user_id, iso_year, iso_week]
 
     # ---------- Mood ----------
     MoodEntry:

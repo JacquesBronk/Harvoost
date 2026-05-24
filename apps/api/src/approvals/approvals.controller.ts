@@ -6,6 +6,7 @@ import { CurrentUser, type CurrentUserPayload } from '../common/current-user.dec
 import { ZodValidationPipe } from '../common/dto/zod-validation.pipe';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../common/audit/audit.service';
+import { PeriodService } from '../timesheet-periods/period.service';
 
 const ManagerActionSchema = z.object({
   entry_ids: z.array(z.string()).min(1),
@@ -24,7 +25,34 @@ export class ApprovalsController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly periods: PeriodService,
   ) {}
+
+  // FEAT-002 (issue #6): after a batch of per-entry transitions, recompute the affected periods
+  // so the derived period status follows the entries (DESIGN §2/§4). Resolves each entry's
+  // (user_id, ISO-week) in the owner's TZ and recomputes each distinct week once. NO contract
+  // change to the approval endpoints; this only keeps the period rollup consistent.
+  private async recomputeAffectedPeriods(entryIds: string[]): Promise<void> {
+    const seen = new Set<string>();
+    for (const entryId of entryIds) {
+      const rows = await this.prisma.$queryRawUnsafe<Array<{ user_id: unknown; start_at: unknown }>>(
+        `SELECT user_id, start_at FROM time_entries WHERE id = $1::bigint LIMIT 1`,
+        entryId,
+      );
+      if (rows.length === 0) continue;
+      const userId = String(rows[0]!.user_id);
+      const userTz = await this.periods.getUserTz(this.prisma, userId);
+      const { isoYear, isoWeek } = await this.periods.resolveWeek(
+        this.prisma,
+        userTz,
+        rows[0]!.start_at as string | Date,
+      );
+      const key = `${userId}:${isoYear}:${isoWeek}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      await this.periods.recomputePeriod(this.prisma, userId, userTz, isoYear, isoWeek);
+    }
+  }
 
   @Get('queue')
   async queue(@CurrentUser() user: CurrentUserPayload, @Query('limit') limit = '50') {
@@ -78,6 +106,9 @@ export class ApprovalsController {
         reason: body.reason,
       });
     }
+    // FEAT-002: recompute the affected periods (manager_approved if all reach stage-1; rejected
+    // if any entry was rejected). The period status follows its entries.
+    await this.recomputeAffectedPeriods(body.entry_ids);
     return { ok: true };
   }
 
@@ -128,6 +159,10 @@ export class ApprovalsController {
         reason: body.reason,
       });
     }
+    // FEAT-002: recompute the affected periods (final_approved if all reach stage-2; rejected if
+    // any was rejected). Runs only after the loop — a stage1≠stage2 violation throws above and
+    // leaves the period at manager_approved (no recompute on a failed transition).
+    await this.recomputeAffectedPeriods(body.entry_ids);
     return { ok: true };
   }
 
@@ -161,6 +196,9 @@ export class ApprovalsController {
       after: { status: 'draft' },
       reason: body.reason,
     });
+    // FEAT-002 (D4 reopen mechanism): the entry just dropped to draft, so the period now has a
+    // <submitted member and recomputes to 'open' with reopened_at set. Writes are accepted again.
+    await this.recomputeAffectedPeriods([entryId]);
     return { ok: true };
   }
 }

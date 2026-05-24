@@ -419,3 +419,90 @@ export interface ApprovalBatchResponse {
   rejected_ids: string[];
   skipped?: Array<{ entry_id: string; reason: string }>;
 }
+
+// ---------------------------------------------------------------------------
+// FEAT-002 (GitHub #6) — period / timesheet approval locking (Option F).
+// Shapes pinned by the backend HANDOFF (`>>> PINNED API SHAPES <<<`). The
+// backend computes period status as a derived rollup of the user's non-running
+// entries in the ISO-week (owner TZ). These are NOT authoritative — openapi.yaml
+// is — but they mirror the pinned contract the FE consumes.
+// ---------------------------------------------------------------------------
+
+/** Derived period status rollup. `open` means the week is writable. */
+export type TimesheetPeriodStatus =
+  | 'open'
+  | 'submitted'
+  | 'manager_approved'
+  | 'final_approved'
+  | 'rejected';
+
+/** Per-status entry counts inside an ISO-week period. */
+export interface TimesheetPeriodEntryCounts {
+  draft: number;
+  submitted: number;
+  manager_approved: number;
+  final_approved: number;
+  rejected: number;
+}
+
+/**
+ * FEAT-002: `GET /v1/timesheet-periods/{iso_week}` (self) — a persisted period
+ * row OR, when no row exists yet, a synthesized OPEN shell (which omits `id` and
+ * returns `week_start_date: null`; same field set otherwise). `iso_week` here is
+ * the numeric ISO week (e.g. 21), NOT the `YYYY-Www` token used in the URL.
+ */
+export interface TimesheetPeriod {
+  id?: string;
+  user_id: string;
+  iso_year: number;
+  iso_week: number;
+  week_start_date: string | null;
+  status: TimesheetPeriodStatus;
+  submitted_at?: string | null;
+  submitted_by?: string | null;
+  manager_approved_at?: string | null;
+  final_approved_at?: string | null;
+  reopened_at?: string | null;
+  entry_counts: TimesheetPeriodEntryCounts;
+}
+
+/** FEAT-002: `GET /v1/timesheet-periods` (list) envelope. */
+export interface TimesheetPeriodList {
+  data: TimesheetPeriod[];
+}
+
+/** FEAT-002: request body for `POST /v1/time-entries/{entry_id}/submit`. */
+export interface SubmitTimeEntryRequest {
+  scope?: 'entry' | 'week';
+  iso_week?: string;
+}
+
+/** A reason an entry was skipped during a week submit. */
+export type SubmitSkipReason = 'running' | 'already_submitted';
+
+/**
+ * FEAT-002: response from `POST /v1/time-entries/{entry_id}/submit`.
+ * `submitted_ids` are string-encoded bigints; `skipped` carries a reason per
+ * entry that was NOT submitted (a running timer, or an already-submitted entry).
+ */
+export interface SubmitWeekResponse {
+  submitted_ids: string[];
+  skipped: Array<{ entry_id: string; reason: SubmitSkipReason }>;
+}
+
+/** FEAT-002: request body for the admin unlock-week endpoint. */
+export interface UnlockWeekRequest {
+  /** Free-text justification — backend requires >= 20 chars. */
+  reason: string;
+}
+
+/**
+ * FEAT-002: response from
+ * `POST /v1/timesheet-periods/{user_id}/{iso_week}/unlock` (admin).
+ */
+export interface UnlockWeekResponse {
+  unlocked_ids: string[];
+  user_id: string;
+  iso_year: number;
+  iso_week: number;
+}

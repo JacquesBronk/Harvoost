@@ -189,6 +189,13 @@ export function newIdempotencyKey(): string {
 export const friendlyErrorMessages: Record<string, string> = {
   RBAC_FORBIDDEN: 'You do not have access to this resource.',
   ENTRY_LOCKED: 'This time entry is locked for editing.',
+  // FEAT-002 (GitHub #6): a 409 PERIOD_LOCKED is returned when you try to add,
+  // move, start/switch, or delete an entry in a week that has already been
+  // submitted or approved. Surface a clear sentence instead of the raw code so
+  // the create/edit flows (NewEntryForm, manual edit) and the TimerBar
+  // start/switch/stop paths all read gracefully via describeError().
+  PERIOD_LOCKED:
+    "This week has been submitted or approved and is locked — you can't add or change entries in it.",
   CHATBOT_DISABLED:
     'The chatbot is currently unavailable. Please contact your administrator.',
   IDEMPOTENCY_CONFLICT: 'A conflicting request is already in progress.',

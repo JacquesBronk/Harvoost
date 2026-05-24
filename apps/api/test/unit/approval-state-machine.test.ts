@@ -24,8 +24,15 @@ function makeController(state: MockState) {
       return 1;
     }),
   };
+  // FEAT-002: PeriodService stub — recompute is a no-op for these per-entry state-machine tests.
+  const periods = {
+    getUserTz: vi.fn(async () => 'Africa/Johannesburg'),
+    resolveWeek: vi.fn(async () => ({ isoYear: 2026, isoWeek: 21, weekStartDate: '2026-05-18' })),
+    assertPeriodWritable: vi.fn(async () => undefined),
+    recomputePeriod: vi.fn(async () => undefined),
+  };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return new ApprovalsController(prisma as any, { record: async () => undefined } as any);
+  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods as any);
 }
 
 describe('Approval state machine — manager approve/reject (REQUIREMENTS F6.1)', () => {

@@ -1,11 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OIDCFailureError = exports.ChatbotDisabledError = exports.LLMUnavailableError = exports.RateLimitedError = exports.IdempotencyConflictError = exports.EntryLockedError = exports.NotFoundError = exports.ValidationFailedError = exports.DomainError = exports.ErrorCode = void 0;
+exports.OIDCFailureError = exports.ChatbotDisabledError = exports.LLMUnavailableError = exports.RateLimitedError = exports.IdempotencyConflictError = exports.PeriodLockedError = exports.EntryLockedError = exports.NotFoundError = exports.ValidationFailedError = exports.DomainError = exports.ErrorCode = void 0;
 // Canonical error codes per API_NOTES.md § Error envelope.
 // Every domain error in apps/api maps to one of these for the wire envelope.
 exports.ErrorCode = {
     RBAC_FORBIDDEN: 'RBAC_FORBIDDEN',
     ENTRY_LOCKED: 'ENTRY_LOCKED',
+    PERIOD_LOCKED: 'PERIOD_LOCKED',
     CHATBOT_DISABLED: 'CHATBOT_DISABLED',
     IDEMPOTENCY_CONFLICT: 'IDEMPOTENCY_CONFLICT',
     VALIDATION_FAILED: 'VALIDATION_FAILED',
@@ -47,6 +48,18 @@ class EntryLockedError extends DomainError {
     }
 }
 exports.EntryLockedError = EntryLockedError;
+// FEAT-002 (issue #6): a write whose start_at lands in an ISO-week with a
+// timesheet_periods row in a LOCKED status (submitted/manager_approved/final_approved).
+// Mirrors EntryLockedError exactly; the global HttpExceptionFilter maps it to
+// {code,message,details}. The DB lock trigger (SQLSTATE HV001) is the TOCTOU backstop;
+// the app-level assertPeriodWritable precheck throws this directly for a clean envelope.
+class PeriodLockedError extends DomainError {
+    constructor(isoYear, isoWeek, status) {
+        super(exports.ErrorCode.PERIOD_LOCKED, `Cannot write into week ${isoYear}-W${String(isoWeek).padStart(2, '0')} — it is ${status} and locked.`, 409, { iso_year: isoYear, iso_week: isoWeek, status });
+        this.name = 'PeriodLockedError';
+    }
+}
+exports.PeriodLockedError = PeriodLockedError;
 class IdempotencyConflictError extends DomainError {
     constructor(message = 'Idempotency key reused with a different payload.') {
         super(exports.ErrorCode.IDEMPOTENCY_CONFLICT, message, 409);

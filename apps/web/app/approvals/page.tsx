@@ -17,7 +17,10 @@ import {
 import { DateTime } from 'luxon';
 import { PageHeader } from '@/components/PageHeader.js';
 import { ErrorBlock } from '@/components/ErrorBlock.js';
+import { UnlockWeekButton } from '@/components/UnlockWeekButton.js';
 import { apiFetch } from '@/lib/api-client.js';
+import { useCurrentUser, isAdmin } from '@/lib/auth.js';
+import { ISO_WEEK_TOKEN_RE } from '@/lib/timesheet-periods.js';
 import { formatHours } from '@/lib/tz.js';
 import type { Paginated } from '@/lib/api-types.js';
 
@@ -35,6 +38,8 @@ interface ApprovalQueueItem {
 // POST /v1/approvals/timesheets/manager with { entry_ids[], action, reason? }.
 
 export default function ApprovalsPage() {
+  const { data: user } = useCurrentUser();
+  const admin = isAdmin(user);
   const queue = useQuery({
     queryKey: ['approvals', 'queue', 'manager'],
     queryFn: () =>
@@ -77,6 +82,7 @@ export default function ApprovalsPage() {
                 <TH className="text-right">Hours</TH>
                 <TH>Status</TH>
                 <TH>Submitted</TH>
+                {admin ? <TH className="text-right">Admin</TH> : null}
               </TR>
             </THead>
             <TBody>
@@ -96,6 +102,23 @@ export default function ApprovalsPage() {
                   <TD className="text-neutral-500">
                     {DateTime.fromISO(r.submitted_at).toRelative()}
                   </TD>
+                  {admin ? (
+                    <TD className="text-right">
+                      {/* FEAT-002: admin-only unlock-week. Only render when the
+                          row carries a well-formed YYYY-Www token the unlock URL
+                          needs — guards against queue shapes that label the week
+                          differently. */}
+                      {ISO_WEEK_TOKEN_RE.test(r.iso_week) ? (
+                        <UnlockWeekButton
+                          userId={r.user_id}
+                          isoWeek={r.iso_week}
+                          userName={r.user_name}
+                        />
+                      ) : (
+                        <span className="text-xs text-neutral-400">—</span>
+                      )}
+                    </TD>
+                  ) : null}
                 </TR>
               ))}
             </TBody>

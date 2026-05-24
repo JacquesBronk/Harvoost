@@ -650,23 +650,98 @@ function routeRequest(
     state.idempotency.set(idemKey, running);
     return { status: 200, body: { entry: running } };
   }
-  // Submit week via POST /v1/time-entries/:id/submit { scope: 'week' }
+  // Submit week via POST /v1/time-entries/:id/submit { scope: 'week' }.
+  // FEAT-002 (GitHub #6): the /timesheets page now consumes the REAL pinned
+  // shape `{ submitted_ids: string[], skipped: [{entry_id, reason}] }` (from
+  // HANDOFF_backend.md) — summarizeSubmitResult() reads result.submitted_ids
+  // .length and result.skipped, so the prior `{ ok: true }` stub made the page
+  // throw and surface "Submission failed". Return the contract-faithful shape:
+  // flip draft → submitted, skip running ("running") + already-locked
+  // ("already_submitted"), reporting both buckets exactly like the live API.
   const submitMatch = /^\/v1\/time-entries\/([^/]+)\/submit$/.exec(path);
   if (submitMatch && method === 'POST') {
-    const anyDraft = state.entries.get(submitMatch[1]!);
-    if (!anyDraft || anyDraft.user_id !== state.actor.id) {
+    const anchor = state.entries.get(submitMatch[1]!);
+    if (!anchor || anchor.user_id !== state.actor.id) {
       return { status: 404, body: { code: 'NOT_FOUND', message: 'Entry not found' } };
     }
+    const submittedIds: string[] = [];
+    const skipped: Array<{ entry_id: string; reason: 'running' | 'already_submitted' }> = [];
     if (body?.scope === 'week') {
       for (const e of state.entries.values()) {
-        if (e.user_id === state.actor.id && e.status === 'draft') {
+        if (e.user_id !== state.actor.id) continue;
+        if (e.status === 'draft') {
           e.status = 'submitted';
+          submittedIds.push(e.id);
+        } else if (e.status === 'running') {
+          skipped.push({ entry_id: e.id, reason: 'running' });
+        } else if (
+          e.status === 'submitted' ||
+          e.status === 'manager_approved' ||
+          e.status === 'final_approved'
+        ) {
+          skipped.push({ entry_id: e.id, reason: 'already_submitted' });
         }
       }
-    } else if (anyDraft.status === 'draft') {
-      anyDraft.status = 'submitted';
+    } else {
+      // scope=entry — submit just the anchor.
+      if (anchor.status === 'draft') {
+        anchor.status = 'submitted';
+        submittedIds.push(anchor.id);
+      } else if (anchor.status === 'running') {
+        skipped.push({ entry_id: anchor.id, reason: 'running' });
+      } else {
+        skipped.push({ entry_id: anchor.id, reason: 'already_submitted' });
+      }
     }
-    return { status: 200, body: { ok: true } };
+    return { status: 200, body: { submitted_ids: submittedIds, skipped } };
+  }
+
+  // GET /v1/timesheet-periods/{iso_week} (self) — FEAT-002. The /timesheets page
+  // reads this on load to drive the locked banner + Submit-week gating. Without a
+  // handler this 404'd (the page tolerates that via retry:false, but the banner
+  // never showed in mocked mode). Synthesize a derived rollup of the actor's
+  // entries: the LEAST-advanced approval state among non-running entries (rejected
+  // pulls to rejected; all-final → final_approved; etc.), matching the backend
+  // rollup. {iso_week} is the YYYY-Www token; we do NOT bucket by real week here
+  // (the mock seeds all entries "this week"), so the status reflects the actor's
+  // whole entry set — sufficient for the page's submitted/locked UI in mocked mode.
+  const periodMatch = /^\/v1\/timesheet-periods\/(\d{4})-W(\d{2})$/.exec(path);
+  if (periodMatch && method === 'GET') {
+    const isoYear = Number(periodMatch[1]);
+    const isoWeek = Number(periodMatch[2]);
+    const counts = { draft: 0, submitted: 0, manager_approved: 0, final_approved: 0, rejected: 0 };
+    for (const e of state.entries.values()) {
+      if (e.user_id !== state.actor.id) continue;
+      if (e.status === 'running') continue;
+      if (e.status in counts) counts[e.status as keyof typeof counts]++;
+    }
+    const total =
+      counts.draft + counts.submitted + counts.manager_approved + counts.final_approved + counts.rejected;
+    let status: 'open' | 'submitted' | 'manager_approved' | 'final_approved' | 'rejected';
+    if (total === 0) status = 'open';
+    else if (counts.rejected > 0) status = 'rejected';
+    else if (counts.final_approved === total) status = 'final_approved';
+    else if (counts.manager_approved + counts.final_approved === total) status = 'manager_approved';
+    else if (counts.draft === 0) status = 'submitted';
+    else status = 'open';
+    const hasRow = status !== 'open';
+    return {
+      status: 200,
+      body: {
+        ...(hasRow ? { id: `period-${state.actor.id}-${isoYear}-${isoWeek}` } : {}),
+        user_id: state.actor.id,
+        iso_year: isoYear,
+        iso_week: isoWeek,
+        week_start_date: hasRow ? '2026-05-18' : null,
+        status,
+        submitted_at: status !== 'open' ? new Date().toISOString() : null,
+        submitted_by: status !== 'open' ? state.actor.id : null,
+        manager_approved_at: null,
+        final_approved_at: null,
+        reopened_at: null,
+        entry_counts: counts,
+      },
+    };
   }
   // Edit / delete with lock enforcement.
   const editMatch = /^\/v1\/time-entries\/([^/]+)$/.exec(path);

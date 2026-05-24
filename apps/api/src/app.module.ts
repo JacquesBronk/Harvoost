@@ -15,6 +15,7 @@ import { UsersModule } from './users/users.module';
 import { ClientsModule } from './clients/clients.module';
 import { ProjectsModule } from './projects/projects.module';
 import { TimeEntriesModule } from './time-entries/time-entries.module';
+import { TimesheetPeriodsModule } from './timesheet-periods/timesheet-periods.module';
 import { MoodModule } from './mood/mood.module';
 import { SchedulesModule } from './schedules/schedules.module';
 import { LeaveModule } from './leave/leave.module';
@@ -65,6 +66,7 @@ import { PrincipalThrottlerGuard } from './common/throttler/principal-throttler.
     ClientsModule,
     ProjectsModule,
     TimeEntriesModule,
+    TimesheetPeriodsModule,
     MoodModule,
     SchedulesModule,
     LeaveModule,

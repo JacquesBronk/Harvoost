@@ -17,8 +17,15 @@ function makeController(stage1Actor: string) {
     }),
     $executeRawUnsafe: vi.fn(async () => 1),
   };
+  // FEAT-002: PeriodService stub — recompute is a no-op for the two-stage invariant tests.
+  const periods = {
+    getUserTz: vi.fn(async () => 'Africa/Johannesburg'),
+    resolveWeek: vi.fn(async () => ({ isoYear: 2026, isoWeek: 21, weekStartDate: '2026-05-18' })),
+    assertPeriodWritable: vi.fn(async () => undefined),
+    recomputePeriod: vi.fn(async () => undefined),
+  };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return new ApprovalsController(prisma as any, { record: async () => undefined } as any);
+  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods as any);
 }
 
 describe('Two-stage approval invariant', () => {

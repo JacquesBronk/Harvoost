@@ -1,6 +1,7 @@
 export declare const ErrorCode: {
     readonly RBAC_FORBIDDEN: "RBAC_FORBIDDEN";
     readonly ENTRY_LOCKED: "ENTRY_LOCKED";
+    readonly PERIOD_LOCKED: "PERIOD_LOCKED";
     readonly CHATBOT_DISABLED: "CHATBOT_DISABLED";
     readonly IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT";
     readonly VALIDATION_FAILED: "VALIDATION_FAILED";
@@ -25,6 +26,9 @@ export declare class NotFoundError extends DomainError {
 }
 export declare class EntryLockedError extends DomainError {
     constructor(entryId: number | string, status: string);
+}
+export declare class PeriodLockedError extends DomainError {
+    constructor(isoYear: number, isoWeek: number, status: string);
 }
 export declare class IdempotencyConflictError extends DomainError {
     constructor(message?: string);

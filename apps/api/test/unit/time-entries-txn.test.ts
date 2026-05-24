@@ -85,6 +85,16 @@ function makeSyncStub() {
   return { emit: vi.fn(), subscribe: vi.fn(), subscriberCount: vi.fn(() => 0) };
 }
 
+// FEAT-002: PeriodService stub — always writable, no-op recompute.
+function makePeriodsStub() {
+  return {
+    getUserTz: vi.fn(async () => 'Africa/Johannesburg'),
+    resolveWeek: vi.fn(async () => ({ isoYear: 2026, isoWeek: 21, weekStartDate: '2026-05-18' })),
+    assertPeriodWritable: vi.fn(async () => undefined),
+    recomputePeriod: vi.fn(async () => undefined),
+  };
+}
+
 const user = { userId: '10', email: 'e@x', roles: ['employee'] };
 
 describe('TimeEntriesController start/switch — M1 transactional fix', () => {
@@ -102,7 +112,7 @@ describe('TimeEntriesController start/switch — M1 transactional fix', () => {
     audit = makeAuditStub();
     sync = makeSyncStub();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ctrl = new TimeEntriesController(prisma as any, idem as any, rbac as any, audit as any, sync as any);
+    ctrl = new TimeEntriesController(prisma as any, idem as any, rbac as any, audit as any, sync as any, makePeriodsStub() as any);
   });
 
   it('start: requires idempotency-key header', async () => {

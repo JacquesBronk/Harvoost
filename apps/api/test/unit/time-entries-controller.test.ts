@@ -92,6 +92,17 @@ function makeRbac(): RbacScopeService {
   } as unknown as RbacScopeService;
 }
 
+// FEAT-002: PeriodService stub — week always writable, recompute is a no-op, tz fixed.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function makePeriods(): any {
+  return {
+    getUserTz: async () => 'Africa/Johannesburg',
+    resolveWeek: async () => ({ isoYear: 2026, isoWeek: 21, weekStartDate: '2026-05-18' }),
+    assertPeriodWritable: async () => undefined,
+    recomputePeriod: async () => undefined,
+  };
+}
+
 describe('POST /v1/time-entries/start — idempotency header enforcement', () => {
   let prisma: ReturnType<typeof makePrisma>;
   let ctrl: TimeEntriesController;
@@ -100,7 +111,7 @@ describe('POST /v1/time-entries/start — idempotency header enforcement', () =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const idem = new IdempotencyService(prisma as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any);
+    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any, makePeriods());
   });
   const employee = { userId: '101', email: 'e@h.local', roles: ['employee'] };
 
@@ -140,7 +151,7 @@ describe('Cost-column stripping for non-financial roles (API_NOTES § Cost-colum
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const idem = new IdempotencyService(prisma as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any);
+    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any, makePeriods());
   });
 
   it('Employee role: response from start() OMITS cost_rate, cost_amount entirely (not null)', async () => {
@@ -181,7 +192,7 @@ describe('Manual time-entry create — overlap detection (REQUIREMENTS F2.1)', (
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const idem = new IdempotencyService(prisma as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any);
+    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any, makePeriods());
   });
   const employee = { userId: '101', email: 'e@h.local', roles: ['employee'] };
 
@@ -241,7 +252,7 @@ describe('Edit blocked when entry is locked (REQUIREMENTS F2.1 — submitted/man
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const idem = new IdempotencyService(prisma as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any);
+    ctrl = new TimeEntriesController(prisma as any, idem, makeRbac(), { record: async () => undefined } as any, { emit: () => {}, subscribe: () => ({ subject: {}, unsubscribe: () => {} }), subscriberCount: () => 0 } as any, makePeriods());
   });
 
   it.each(['submitted', 'manager_approved', 'final_approved'])(

@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  Badge,
   Button,
   Card,
   EmptyState,
@@ -15,7 +16,7 @@ import {
   useToast,
 } from '@harvoost/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, ChevronRight, Plus, Send } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Lock, Plus, Send } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { PageHeader } from '@/components/PageHeader.js';
@@ -23,8 +24,16 @@ import { ErrorBlock } from '@/components/ErrorBlock.js';
 import { StartTimerControl } from '@/components/StartTimerControl.js';
 import { NewEntryForm } from '@/components/NewEntryForm.js';
 import { apiFetch, describeError } from '@/lib/api-client.js';
-import type { Paginated, TimeEntry } from '@/lib/api-types.js';
+import type { Paginated, SubmitWeekResponse, TimeEntry } from '@/lib/api-types.js';
 import { formatHours, isoWeekRange, viewerTimeZone } from '@/lib/tz.js';
+import {
+  canSubmitWeek,
+  fetchPeriod,
+  isoWeekToken,
+  periodLockBanner,
+  submitWeek,
+  summarizeSubmitResult,
+} from '@/lib/timesheet-periods.js';
 import { useCurrentUser } from '@/lib/auth.js';
 
 export default function TimesheetsPage() {
@@ -54,24 +63,48 @@ export default function TimesheetsPage() {
 
   const entries = entriesQuery.data?.items ?? [];
 
+  // FEAT-002: read the period status for the current ISO week so we can show
+  // whether it's open / submitted / approved and drive the Submit-week button +
+  // locked banner. Resilient: if this call fails we fall back to the
+  // entries-only behavior (no banner, gating from drafts alone) — never break
+  // the page. Synthesized open shell when no row exists yet.
+  const weekToken = useMemo(() => isoWeekToken(anchorIso, zone), [anchorIso, zone]);
+  const periodQuery = useQuery({
+    queryKey: ['timesheet-period', weekToken],
+    queryFn: () => fetchPeriod(weekToken),
+    enabled: !!user && !!weekToken,
+    retry: false,
+  });
+  const period = periodQuery.isError ? undefined : periodQuery.data;
+  const lockBanner = periodLockBanner(period);
+
   // Per API_NOTES.md (decision #4 + #10): per-week submission is expressed as
   // POST /v1/time-entries/{entry_id}/submit with scope=week. We send the
   // request against any draft entry in the week; the server interprets
-  // scope=week and submits all draft entries in that ISO week.
+  // scope=week and submits all draft entries in that ISO week, returning
+  // { submitted_ids, skipped }.
   const submitMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: (): Promise<SubmitWeekResponse> => {
       const anyDraft = entries.find((e) => e.status === 'draft');
       if (!anyDraft) {
         throw new Error('Nothing to submit.');
       }
-      return apiFetch(`/v1/time-entries/${anyDraft.id}/submit`, {
-        method: 'POST',
-        body: { scope: 'week' },
-      });
+      return submitWeek(anyDraft.id);
     },
-    onSuccess: () => {
-      toast.success('Week submitted', 'Your timesheet is now awaiting manager approval.');
+    onSuccess: (result) => {
+      const { title, detail } = summarizeSubmitResult(result);
+      if (result.submitted_ids.length === 0) {
+        toast.warning(title, detail);
+      } else if (result.skipped.length > 0) {
+        // Partial success — some entries went through, some were skipped.
+        toast.warning(title, detail);
+      } else {
+        toast.success(title, detail);
+      }
+      // The week is now locked; refresh both the entries and the period status
+      // so the badge/banner and disabled Submit button reflect it immediately.
       queryClient.invalidateQueries({ queryKey: ['time-entries'] });
+      queryClient.invalidateQueries({ queryKey: ['timesheet-period'] });
     },
     onError: (err) => toast.error('Submission failed', describeError(err)),
   });
@@ -82,7 +115,8 @@ export default function TimesheetsPage() {
     [entries],
   );
 
-  const canSubmit = entries.length > 0 && entries.every((e) => e.status === 'draft');
+  const hasDraft = entries.some((e) => e.status === 'draft');
+  const canSubmit = canSubmitWeek(period, hasDraft);
 
   function shiftWeek(deltaDays: number) {
     const next = DateTime.fromISO(anchorIso ?? '', { zone })
@@ -120,6 +154,10 @@ export default function TimesheetsPage() {
               variant="secondary"
               size="sm"
               iconLeft={<Plus className="h-3.5 w-3.5" aria-hidden="true" />}
+              disabled={!!lockBanner}
+              title={
+                lockBanner ? `${lockBanner.label} — adding entries is disabled` : undefined
+              }
               onClick={() => setNewEntryOpen(true)}
             >
               New entry
@@ -148,12 +186,35 @@ export default function TimesheetsPage() {
         title={week.weekLabel}
         subtitle={`All times shown in ${zone}`}
         actions={
-          <span className="text-sm font-semibold text-neutral-900">
-            {formatHours(weekTotal)} total
-          </span>
+          <div className="flex items-center gap-3">
+            {lockBanner ? (
+              <Badge tone={lockBanner.tone} dot>
+                <Lock className="h-3 w-3" aria-hidden="true" />
+                {lockBanner.label}
+              </Badge>
+            ) : null}
+            <span className="text-sm font-semibold text-neutral-900">
+              {formatHours(weekTotal)} total
+            </span>
+          </div>
         }
         padded={false}
       >
+        {lockBanner ? (
+          <div
+            role="status"
+            className="flex items-start gap-2 border-b border-neutral-100 bg-neutral-50/60 px-4 py-3 text-sm text-neutral-600"
+          >
+            <Lock
+              className="mt-0.5 h-4 w-4 shrink-0 text-neutral-400"
+              aria-hidden="true"
+            />
+            <p>
+              {lockBanner.label}. You can&rsquo;t add, edit, move, or delete entries
+              in this week. An administrator can unlock it if a change is needed.
+            </p>
+          </div>
+        ) : null}
         {entriesQuery.isLoading ? (
           <div className="px-4 py-8 text-center">
             <LoadingSpinner size="md" label="Loading entries" />

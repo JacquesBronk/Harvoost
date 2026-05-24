@@ -1,5 +1,9 @@
 import { Module } from '@nestjs/common';
 import { ApprovalsController } from './approvals.controller';
+import { TimesheetPeriodsModule } from '../timesheet-periods/timesheet-periods.module';
 
-@Module({ controllers: [ApprovalsController] })
+@Module({
+  imports: [TimesheetPeriodsModule],
+  controllers: [ApprovalsController],
+})
 export class ApprovalsModule {}

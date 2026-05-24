@@ -3,6 +3,7 @@
 export const ErrorCode = {
   RBAC_FORBIDDEN: 'RBAC_FORBIDDEN',
   ENTRY_LOCKED: 'ENTRY_LOCKED',
+  PERIOD_LOCKED: 'PERIOD_LOCKED',
   CHATBOT_DISABLED: 'CHATBOT_DISABLED',
   IDEMPOTENCY_CONFLICT: 'IDEMPOTENCY_CONFLICT',
   VALIDATION_FAILED: 'VALIDATION_FAILED',
@@ -58,6 +59,23 @@ export class EntryLockedError extends DomainError {
       { entry_id: entryId, status },
     );
     this.name = 'EntryLockedError';
+  }
+}
+
+// FEAT-002 (issue #6): a write whose start_at lands in an ISO-week with a
+// timesheet_periods row in a LOCKED status (submitted/manager_approved/final_approved).
+// Mirrors EntryLockedError exactly; the global HttpExceptionFilter maps it to
+// {code,message,details}. The DB lock trigger (SQLSTATE HV001) is the TOCTOU backstop;
+// the app-level assertPeriodWritable precheck throws this directly for a clean envelope.
+export class PeriodLockedError extends DomainError {
+  constructor(isoYear: number, isoWeek: number, status: string) {
+    super(
+      ErrorCode.PERIOD_LOCKED,
+      `Cannot write into week ${isoYear}-W${String(isoWeek).padStart(2, '0')} — it is ${status} and locked.`,
+      409,
+      { iso_year: isoYear, iso_week: isoWeek, status },
+    );
+    this.name = 'PeriodLockedError';
   }
 }
 

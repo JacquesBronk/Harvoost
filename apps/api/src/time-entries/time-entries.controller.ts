@@ -19,6 +19,7 @@ import { EntryLockedError, IdempotencyConflictError, NotFoundError, ValidationFa
 import { RBAC_SCOPE_SERVICE } from '../rbac/rbac.module';
 import { AuditService } from '../common/audit/audit.service';
 import { SyncService } from '../sync/sync.service';
+import { PeriodService, mapPeriodLockDbError } from '../timesheet-periods/period.service';
 
 const StartSchema = z.object({
   project_id: z.string(),
@@ -61,6 +62,13 @@ const PatchEntrySchema = z
   .strict()
   .partial();
 
+// FEAT-002 (issue #6) — submit request. scope defaults to 'entry'; 'week' submits the whole
+// ISO-week the entry belongs to (what the FE sends). iso_week overrides the target week.
+const SubmitSchema = z.object({
+  scope: z.enum(['entry', 'week']).default('entry'),
+  iso_week: z.string().regex(/^\d{4}-W\d{2}$/).optional(),
+});
+
 const ListQuery = z.object({
   user_id: z.string().optional(),
   project_id: z.string().optional(),
@@ -81,6 +89,7 @@ export class TimeEntriesController {
     @Inject(RBAC_SCOPE_SERVICE) private readonly rbac: RbacScopeService,
     private readonly audit: AuditService,
     private readonly sync: SyncService,
+    private readonly periods: PeriodService,
   ) {}
 
   @Get()
@@ -165,6 +174,11 @@ export class TimeEntriesController {
     let out: Record<string, unknown>;
     try {
       out = await this.prisma.$transaction(async (tx) => {
+        // FEAT-002: defensively reject starting a timer whose NOW() lands in a locked current
+        // week (possible if the user submitted the in-progress week early). Cheap precheck;
+        // the DB trigger (HV001) is the backstop on the INSERT below.
+        const userTz = await this.periods.getUserTz(tx, user.userId);
+        await this.periods.assertPeriodWritable(tx, user.userId, userTz, new Date());
         await tx.$executeRawUnsafe(
           `UPDATE time_entries SET end_at = NOW(), status = 'draft', updated_at = NOW()
            WHERE user_id = $1::bigint AND status = 'running'`,
@@ -184,6 +198,10 @@ export class TimeEntriesController {
         return normalizeRow(rows[0]!, user.roles);
       });
     } catch (err) {
+      // FEAT-002: a concurrent submit may have locked the week between the precheck and the
+      // INSERT — the DB trigger rejects with HV001. Map it to a clean 409 PERIOD_LOCKED.
+      const mapped = mapPeriodLockDbError(err);
+      if (mapped !== err) throw mapped;
       // Race condition: a concurrent start raced this one. Both UPDATEs ran; both INSERTs
       // attempted; one violated te_one_running_per_user. Convert to a clean 409.
       if (isUniqueViolation(err, 'te_one_running_per_user') || isUniqueViolation(err, 'te_idempotency_unique')) {
@@ -246,6 +264,9 @@ export class TimeEntriesController {
     let out: Record<string, unknown>;
     try {
       out = await this.prisma.$transaction(async (tx) => {
+        // FEAT-002: defensively reject a switch whose NOW() lands in a locked current week.
+        const userTz = await this.periods.getUserTz(tx, user.userId);
+        await this.periods.assertPeriodWritable(tx, user.userId, userTz, new Date());
         await tx.$executeRawUnsafe(
           `UPDATE time_entries SET end_at = NOW(), status = 'draft', updated_at = NOW()
            WHERE user_id = $1::bigint AND status = 'running'`,
@@ -264,6 +285,9 @@ export class TimeEntriesController {
         return normalizeRow(rows[0]!, user.roles);
       });
     } catch (err) {
+      // FEAT-002: map the DB lock trigger (HV001) to a clean 409 PERIOD_LOCKED (TOCTOU backstop).
+      const mapped = mapPeriodLockDbError(err);
+      if (mapped !== err) throw mapped;
       if (isUniqueViolation(err, 'te_one_running_per_user') || isUniqueViolation(err, 'te_idempotency_unique')) {
         throw new IdempotencyConflictError();
       }
@@ -275,6 +299,125 @@ export class TimeEntriesController {
     await this.enqueueOvertimeCheck(user.userId);
 
     return out;
+  }
+
+  // FEAT-002 (issue #6) — submit an entry's week (scope='week', what the FE sends) or just the
+  // single entry (scope='entry'). Self-only: the entry_id must belong to the caller (else 404,
+  // mirroring the PATCH self-check). Flips draft→submitted, writes history rows (actor=owner),
+  // skips running ('running') and already-submitted+ ('already_submitted'), and upserts the
+  // timesheet_periods row. Returns { submitted_ids, skipped }.
+  @Post(':id/submit')
+  async submit(
+    @CurrentUser() user: CurrentUserPayload,
+    @Param('id') id: string,
+    @Body(new ZodValidationPipe(SubmitSchema)) body: z.infer<typeof SubmitSchema>,
+  ) {
+    // Resolve the anchor entry; self-only.
+    const anchor = await this.prisma.$queryRawUnsafe<Array<{ user_id: unknown; status: unknown; start_at: unknown }>>(
+      `SELECT user_id, status, start_at FROM time_entries WHERE id = $1::bigint LIMIT 1`,
+      id,
+    );
+    if (anchor.length === 0) throw new NotFoundError();
+    if (String(anchor[0]!.user_id) !== user.userId) throw new NotFoundError(); // uniform 404
+
+    const submittedIds: string[] = [];
+    const skipped: Array<{ entry_id: string; reason: string }> = [];
+
+    await this.prisma.$transaction(async (tx) => {
+      const userTz = await this.periods.getUserTz(tx, user.userId);
+
+      // Determine the target ISO-week: explicit iso_week override, else the anchor entry's week.
+      let isoYear: number;
+      let isoWeek: number;
+      if (body.scope === 'week' && body.iso_week) {
+        const m = /^(\d{4})-W(\d{2})$/.exec(body.iso_week);
+        if (!m) throw new ValidationFailedError('iso_week must match YYYY-Www');
+        isoYear = Number(m[1]);
+        isoWeek = Number(m[2]);
+      } else {
+        const w = await this.periods.resolveWeek(tx, userTz, anchor[0]!.start_at as string | Date);
+        isoYear = w.isoYear;
+        isoWeek = w.isoWeek;
+      }
+
+      // Candidate entries to submit.
+      let candidates: Array<{ id: unknown; status: unknown }>;
+      if (body.scope === 'week') {
+        candidates = await tx.$queryRawUnsafe<Array<{ id: unknown; status: unknown }>>(
+          `SELECT id, status FROM time_entries
+           WHERE user_id = $1::bigint
+             AND EXTRACT(ISOYEAR FROM (start_at AT TIME ZONE $2))::int = $3::int
+             AND EXTRACT(WEEK    FROM (start_at AT TIME ZONE $2))::int = $4::int
+           ORDER BY start_at ASC`,
+          user.userId,
+          userTz,
+          isoYear,
+          isoWeek,
+        );
+      } else {
+        // scope='entry' — just the anchor entry (the trivial subset).
+        candidates = [{ id, status: anchor[0]!.status }];
+      }
+
+      for (const c of candidates) {
+        const entryId = String(c.id);
+        const status = String(c.status);
+        if (status === 'running') {
+          skipped.push({ entry_id: entryId, reason: 'running' });
+          continue;
+        }
+        if (status !== 'draft') {
+          skipped.push({ entry_id: entryId, reason: 'already_submitted' });
+          continue;
+        }
+        // Flip draft→submitted (status-only; the DB trigger does NOT fire on this).
+        await tx.$executeRawUnsafe(
+          `UPDATE time_entries SET status = 'submitted', updated_at = NOW()
+           WHERE id = $1::bigint AND status = 'draft'`,
+          entryId,
+        );
+        await tx.$executeRawUnsafe(
+          `INSERT INTO time_entry_state_history (time_entry_id, from_status, to_status, actor_id, reason)
+           VALUES ($1::bigint, 'draft', 'submitted', $2::bigint, NULL)`,
+          entryId,
+          user.userId,
+        );
+        await this.audit.record({
+          actorId: user.userId,
+          action: 'time_entry.submit',
+          entityType: 'time_entry',
+          entityId: entryId,
+          before: { status: 'draft' },
+          after: { status: 'submitted' },
+        });
+        submittedIds.push(entryId);
+      }
+
+      // Upsert the period row to stamp submitted_at/submitted_by (owned by the submit path), then
+      // recompute so the DERIVED status is authoritative. We insert a NEUTRAL 'open' placeholder
+      // status here (not 'submitted') so recompute's reopened-detection — which only fires on a
+      // locked→open drop — does NOT false-trigger on a fresh/partial submit; recompute then sets
+      // the real rollup status (e.g. 'submitted', or 'rejected' if an existing rejected entry, or
+      // 'open' for a still-partial week).
+      await tx.$executeRawUnsafe(
+        `INSERT INTO timesheet_periods
+           (user_id, iso_year, iso_week, week_start_date, status, submitted_at, submitted_by, created_at, updated_at)
+         VALUES (
+           $1::bigint, $2::int, $3::int,
+           (date_trunc('week', make_date($2::int, 1, 4)::timestamp)::date + (($3::int - 1) * 7)),
+           'open', NOW(), $1::bigint, NOW(), NOW())
+         ON CONFLICT (user_id, iso_year, iso_week) DO UPDATE SET
+           submitted_at = COALESCE(timesheet_periods.submitted_at, NOW()),
+           submitted_by = COALESCE(timesheet_periods.submitted_by, EXCLUDED.submitted_by),
+           updated_at = NOW()`,
+        user.userId,
+        isoYear,
+        isoWeek,
+      );
+      await this.periods.recomputePeriod(tx, user.userId, userTz, isoYear, isoWeek);
+    });
+
+    return { submitted_ids: submittedIds, skipped };
   }
 
   // Enqueues a real-time overtime check via pg-boss. Called from stop + switch
@@ -319,18 +462,29 @@ export class TimeEntriesController {
       endAt.toISOString(),
     );
     if (overlap.length > 0) throw new ValidationFailedError('Overlapping time entry exists');
-    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `INSERT INTO time_entries (user_id, project_id, task_id, notes, start_at, end_at, status, billable)
-       VALUES ($1::bigint, $2::bigint, $3::bigint, $4, $5::timestamptz, $6::timestamptz, 'draft', COALESCE($7, TRUE))
-       RETURNING id, user_id, project_id, task_id, notes, start_at, end_at, status, billable`,
-      user.userId,
-      body.project_id,
-      body.task_id ?? null,
-      body.notes ?? null,
-      startAt.toISOString(),
-      endAt.toISOString(),
-      body.billable ?? null,
-    );
+    // FEAT-002 (issue #6, load-bearing): reject a create/back-date whose start_at lands in a
+    // LOCKED period (PERIOD_LOCKED 409). App-level precheck; the DB trigger (HV001) is the backstop.
+    const userTz = await this.periods.getUserTz(this.prisma, user.userId);
+    await this.periods.assertPeriodWritable(this.prisma, user.userId, userTz, startAt);
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
+        `INSERT INTO time_entries (user_id, project_id, task_id, notes, start_at, end_at, status, billable)
+         VALUES ($1::bigint, $2::bigint, $3::bigint, $4, $5::timestamptz, $6::timestamptz, 'draft', COALESCE($7, TRUE))
+         RETURNING id, user_id, project_id, task_id, notes, start_at, end_at, status, billable`,
+        user.userId,
+        body.project_id,
+        body.task_id ?? null,
+        body.notes ?? null,
+        startAt.toISOString(),
+        endAt.toISOString(),
+        body.billable ?? null,
+      );
+    } catch (err) {
+      const mapped = mapPeriodLockDbError(err);
+      if (mapped !== err) throw mapped;
+      throw err;
+    }
     return normalizeRow(rows[0]!, user.roles);
   }
 
@@ -354,6 +508,16 @@ export class TimeEntriesController {
     const status = String(existing[0]!.status);
     if (LOCKED_STATUSES.has(status)) throw new EntryLockedError(id, status);
 
+    // FEAT-002 (issue #6, load-bearing — the PATCH-move hole): if start_at (or end_at) changes,
+    // reject when the NEW start_at lands in a LOCKED destination period (PERIOD_LOCKED 409).
+    // The lock query is on the period table, so moving a draft within its own still-open week
+    // passes. The own-status ENTRY_LOCKED check above fires first.
+    if (body.start_at !== undefined || body.end_at !== undefined) {
+      const newStartAt = body.start_at ?? (existing[0]!.start_at as string | Date);
+      const userTz = await this.periods.getUserTz(this.prisma, user.userId);
+      await this.periods.assertPeriodWritable(this.prisma, user.userId, userTz, newStartAt);
+    }
+
     // Cross-project IDOR guard: when re-pointing to a different project, the new project
     // must be visible to the requester via RBAC.
     if (body.project_id !== undefined && body.project_id !== String(existing[0]!.project_id)) {
@@ -376,10 +540,18 @@ export class TimeEntriesController {
     }
     if (fields.length === 0) return { ok: true };
     params.push(id);
-    await this.prisma.$executeRawUnsafe(
-      `UPDATE time_entries SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${params.length}::bigint`,
-      ...params,
-    );
+    try {
+      await this.prisma.$executeRawUnsafe(
+        `UPDATE time_entries SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${params.length}::bigint`,
+        ...params,
+      );
+    } catch (err) {
+      // FEAT-002: TOCTOU backstop — a concurrent submit locked the destination week between the
+      // precheck and the UPDATE; the DB trigger (HV001) rejects. Map to a clean 409.
+      const mapped = mapPeriodLockDbError(err);
+      if (mapped !== err) throw mapped;
+      throw err;
+    }
     await this.audit.record({
       actorId: user.userId,
       action: 'time_entry.edit',
@@ -401,6 +573,11 @@ export class TimeEntriesController {
     if (String(existing[0]!.user_id) !== user.userId) throw new NotFoundError();
     const status = String(existing[0]!.status);
     if (LOCKED_STATUSES.has(status)) throw new EntryLockedError(id, status);
+    // FEAT-002 (issue #6, APPROVED hardening): block deleting an entry (e.g. a leftover draft)
+    // whose start_at lands in a LOCKED period (PERIOD_LOCKED 409). The own-status ENTRY_LOCKED
+    // check above fires first; this closes the "delete a draft out of a locked week" hole.
+    const userTz = await this.periods.getUserTz(this.prisma, user.userId);
+    await this.periods.assertPeriodWritable(this.prisma, user.userId, userTz, existing[0]!.start_at as string | Date);
     const before = {
       status,
       project_id: String(existing[0]!.project_id),
