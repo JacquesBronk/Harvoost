@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
+  Building2,
   Calendar,
   ClipboardCheck,
   GanttChartSquare,
@@ -66,6 +67,12 @@ const navItems: NavItem[] = [
     visible: (s) => s.canSeeFinancialData,
   },
   { href: '/admin/users', label: 'Users', icon: Users, visible: (s) => s.isAdmin },
+  {
+    href: '/admin/clients',
+    label: 'Clients',
+    icon: Building2,
+    visible: (s) => s.canSeeFinancialData,
+  },
   {
     href: '/admin/projects',
     label: 'Projects',

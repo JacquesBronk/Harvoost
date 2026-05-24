@@ -152,7 +152,9 @@ export default function AdminProjectsPage() {
         if (Number.isFinite(parsed) && parsed >= 0) body.fixed_fee_amount = parsed;
       }
       if (editor.mode === 'create') {
-        body.client_id = Number(editor.clientId);
+        // client_id is a string on the wire (API CreateProjectSchema: z.string());
+        // editor.clientId already holds the picker's String(client.id) value.
+        body.client_id = editor.clientId;
         await createProjectMutation.mutateAsync(body);
         toast.success('Project created', editor.name.trim());
       } else if (editor.id !== undefined) {
