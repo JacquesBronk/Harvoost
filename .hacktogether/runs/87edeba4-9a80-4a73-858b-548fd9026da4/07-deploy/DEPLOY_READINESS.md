@@ -39,6 +39,9 @@ Resetting the dev IdP: `docker compose down keycloak && docker volume rm harvoos
 - [ ] **Application (client) ID + Client Secret captured** → loaded into Key Vault as `OIDC-CLIENT-ID` and `OIDC-CLIENT-SECRET`.
 - [ ] **Issuer URL captured** → `https://login.microsoftonline.com/<tenant-id>/v2.0` → loaded into Key Vault as `OIDC-ISSUER-URL`.
 - [ ] Federated credential added to the App Registration for GitHub Actions OIDC (`repo:<owner>/Harvoost:ref:refs/heads/main` and `:ref:refs/tags/v*`).
+- [ ] **Post-logout redirect URI registered on the App Registration (RP-initiated logout — INC-008/#11).** RP-initiated logout is provider-agnostic: the API builds `${end_session_endpoint}?id_token_hint=…&post_logout_redirect_uri=<web /login>` from the discovered OIDC metadata. But every IdP only honours a post-logout redirect URI that is **allowlisted on the client/app**. Register the production web `/login` URL (e.g. `https://<web-fqdn>/login`) on the Entra App Registration:
+  - Portal: **App Registration → Authentication → "Front-channel logout URL"** = the web `/login` URL, AND add the same `https://<web-fqdn>/login` to the SPA/Web **Redirect URIs** list so Entra accepts it as a `post_logout_redirect_uri`. (Entra validates post-logout redirects against the registered reply/redirect URI set.)
+  - This mirrors the dev Keycloak change in `infra/keycloak/realm.json` (`harvoost-web` client → `post.logout.redirect.uris` now includes `http://localhost:3000/login`). If the prod `/login` URL is NOT registered, logout will succeed at the IdP but the browser lands on Entra's generic "signed out" page instead of returning to Harvoost's `/login`.
 - [ ] Entra admin group object id captured (passed to `adminGroupObjectId` parameter).
 - [ ] First bicep deployment ran successfully (`az deployment group create` for `parameters/prod.bicepparam`).
 - [ ] Key Vault provisioned **and populated with all required secrets** (see "Secrets in Key Vault" matrix below).
@@ -76,6 +79,7 @@ Every row must contain a real value (NOT `__REPLACE_ME__`). The bootstrap proces
 - [ ] `GET /v1/auth/oidc/login` returns a 302 redirect to `https://login.microsoftonline.com/<tenant-id>/...` (works once F3 + OIDC env vars are wired and `OIDC_ISSUER_URL` is set correctly).
 - [ ] The OIDC discovery doc at `${OIDC_ISSUER_URL}/.well-known/openid-configuration` is reachable from the Container App (run `az containerapp exec -n ca-api-prod --command "wget -qO- ${OIDC_ISSUER_URL}/.well-known/openid-configuration | head -50"`).
 - [ ] Container Apps logs show no boot errors (`az containerapp logs show -g <rg> -n ca-api-prod --tail 100`); look for the boot line `oidcIssuer=https://login.microsoftonline.com/...`.
+- [ ] **RP-initiated logout returns to the app (INC-008/#11):** after signing in, hit Sign Out and confirm the browser ends the Entra session AND lands back on `https://<web-fqdn>/login` (not Entra's generic "signed out" page). If it lands on the Entra page, the prod `/login` URL is missing from the App Registration's post-logout/redirect URI allowlist — see "Infra readiness" above.
 - [ ] Worker container logs show pg-boss successfully boots + the 12 jobs are scheduled.
 - [ ] An audit insert succeeds end-to-end (smoke: assign a test admin role and confirm `audit_log` has a new row with non-empty `row_hash`). *This is the V2 check — confirm before declaring deploy successful.*
 

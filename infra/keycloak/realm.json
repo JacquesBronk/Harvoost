@@ -75,7 +75,7 @@
         "tls.client.certificate.bound.access.tokens": "false",
         "require.pushed.authorization.requests": "false",
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "+"
+        "post.logout.redirect.uris": "+##http://localhost:3000/login##http://localhost:3000"
       },
       "fullScopeAllowed": true,
       "defaultClientScopes": [

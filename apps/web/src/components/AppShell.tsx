@@ -21,7 +21,7 @@ import { type ReactNode } from 'react';
 import { Avatar, Badge, LoadingSpinner } from '@harvoost/ui';
 import { useScope } from '@/lib/rbac.js';
 import { resolveAuthGate, useCurrentUser } from '@/lib/auth.js';
-import { env } from '@/lib/env.js';
+import { requestLogout, resolveLogoutNavigation } from '@/lib/logout.js';
 import { TimerBar } from './TimerBar.js';
 
 interface NavItem {
@@ -115,15 +115,20 @@ export function AppShell({ children }: { children: ReactNode }) {
     : currentUser.email;
 
   async function handleSignOut() {
-    try {
-      await fetch(`${env.API_BASE_URL.replace(/\/$/, '')}/v1/auth/logout`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-      });
-    } catch {
-      // Network failure on logout is non-fatal — proceed to redirect.
+    // INC-008 (GitHub #11): revoke the local session, then end the IdP SSO
+    // session via RP-initiated logout. requestLogout preserves the CSRF +
+    // cookie behavior and returns `null` on any failure.
+    const response = await requestLogout();
+    const nav = resolveLogoutNavigation(response);
+    if (nav.kind === 'external') {
+      // A REAL full-page navigation to the IdP end_session_endpoint — NOT
+      // router.push — so the external IdP origin clears the SSO cookie and then
+      // redirects back to the web /login per post_logout_redirect_uri.
+      window.location.assign(nav.url);
+      return;
     }
+    // No usable IdP logout URL (null / non-http(s)) or the request failed —
+    // fall back to a local redirect so the user is never stranded.
     router.push('/login');
   }
 

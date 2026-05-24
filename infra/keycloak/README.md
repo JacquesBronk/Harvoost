@@ -85,10 +85,20 @@ The realm is imported on first start and then persisted in the `keycloak-data` D
 To wipe and re-import from `realm.json`:
 
 ```bash
-docker compose down keycloak
-docker volume rm harvoost-keycloak-data
-docker compose up -d keycloak
+docker compose rm -sf keycloak          # stop + remove the container
+docker volume rm harvoost-keycloak-data # drop the persisted H2 store
+docker compose up -d keycloak           # first start → re-imports realm.json
 ```
+
+> **Editing `realm.json` requires this re-import.** Keycloak imports `realm.json`
+> only on *first* startup against an empty data dir. An existing
+> `harvoost-keycloak-data` volume will NOT pick up your edits on a plain
+> `docker compose up` / rebuild — you must drop the volume as above. The realm
+> (clients + all seeded users) is fully defined by `realm.json`, so the
+> volume drop loses nothing: everything re-seeds on the next first start.
+> (Example: INC-008 added `http://localhost:3000/login` to the `harvoost-web`
+> client's `post.logout.redirect.uris` for RP-initiated logout — that edit only
+> took effect after this volume-drop re-import.)
 
 ## Production note
 

@@ -58,6 +58,12 @@ function makeOidcStub() {
       email: 'alice@example.com',
       name: 'Alice',
     })),
+    buildEndSessionUrl: vi.fn(
+      async (p: { postLogoutRedirectUri: string }) =>
+        `http://localhost:8080/realms/harvoost/protocol/openid-connect/logout?client_id=harvoost-web&post_logout_redirect_uri=${encodeURIComponent(
+          p.postLogoutRedirectUri,
+        )}`,
+    ),
   };
 }
 
@@ -210,7 +216,8 @@ describe('AuthController.oidcCallback — HttpOnly cookie issuance', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       res as any,
     );
-    expect(ret).toEqual({ ok: true });
+    expect(ret.ok).toBe(true);
+    expect(ret).toHaveProperty('logout_url');
     expect(res.cleared).toHaveLength(1);
     expect(res.cleared[0].name).toBe('harvoost_session');
     expect(res.cleared[0].opts.path).toBe('/');

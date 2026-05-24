@@ -266,12 +266,27 @@ paths:
   /v1/auth/logout:
     post:
       tags: [Auth]
-      summary: Revoke the current session
-      description: Marks the current session as revoked. Subsequent requests with this token return 401.
+      summary: Revoke the current session (+ RP-initiated IdP logout)
+      description: |
+        Revokes the local session and clears the session cookie, then returns an OIDC
+        RP-initiated logout URL for the client to navigate to so the IdP SSO session is also
+        ended (provider-agnostic — built from the discovered `end_session_endpoint`). The client
+        navigates to `logout_url` when present; otherwise it falls back to the local `/login`.
       operationId: logout
       responses:
-        '204':
-          description: Session revoked.
+        '200':
+          description: Local session revoked; `logout_url` is the IdP RP-initiated logout URL (or null when the IdP advertises no `end_session_endpoint`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  logout_url:
+                    type: string
+                    nullable: true
+                    description: IdP `end_session_endpoint` URL (with `client_id` + a server-built `post_logout_redirect_uri` to the web `/login`) to navigate to for RP-initiated logout; `null` when no `end_session_endpoint` is discovered (client falls back to local `/login`).
+                required: [ok, logout_url]
         '401':
           $ref: '#/components/responses/Unauthorized'
 

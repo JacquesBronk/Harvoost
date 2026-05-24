@@ -111,6 +111,12 @@ function makeOidcStub(opts: { tokenIdToken?: string; validateClaims?: { sub: str
       if (opts.validateThrows) throw opts.validateThrows;
       return opts.validateClaims ?? { sub: 'sub-1', email: 'alice@example.com', name: 'Alice' };
     }),
+    buildEndSessionUrl: vi.fn(
+      async (p: { postLogoutRedirectUri: string }) =>
+        `http://kc/realms/harvoost/protocol/openid-connect/logout?client_id=harvoost-web&post_logout_redirect_uri=${encodeURIComponent(
+          p.postLogoutRedirectUri,
+        )}`,
+    ),
   };
 }
 
@@ -521,7 +527,8 @@ describe('AuthController.logout', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       res as any,
     );
-    expect(out).toEqual({ ok: true });
+    expect(out.ok).toBe(true);
+    expect(out).toHaveProperty('logout_url');
     expect(res.clearCookie).toHaveBeenCalledWith('harvoost_session', { path: '/' });
   });
 

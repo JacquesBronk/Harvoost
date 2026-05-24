@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Logger, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, Logger, Post, Query, Req, Res } from '@nestjs/common';
 import { Throttle, SkipThrottle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
 import { randomBytes } from 'node:crypto';
@@ -303,8 +303,29 @@ export class AuthController {
     };
   }
 
+  // INC-008: OIDC RP-initiated logout (provider-agnostic, ADR-0001).
+  //
+  // Order matters: revoke the LOCAL session + clear the cookie FIRST, THEN
+  // compute the IdP end-session URL. Local teardown must succeed even if the
+  // IdP URL can't be built (discovery down / no end_session_endpoint).
+  //
+  // The response carries `logout_url`: the IdP `end_session_endpoint` with
+  // `client_id` + a server-built `post_logout_redirect_uri`. The frontend
+  // navigates the browser there to end the IdP SSO session (so the next login
+  // shows the IdP form and can authenticate a DIFFERENT user). When the IdP
+  // exposes no end_session_endpoint, `logout_url` is null and the frontend
+  // falls back to a local /login redirect.
+  //
+  // SECURITY (CWE-601 open redirect): `post_logout_redirect_uri` is built ONLY
+  // from trusted config (WEB_ORIGIN + /login) — NEVER from any request input
+  // (no next/returnTo/Referer/Origin). Option B: we do NOT persist or send the
+  // id_token (no id_token_hint), so there is no migration and no JWT at rest.
+  @HttpCode(200)
   @Post('logout')
-  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response): Promise<{ ok: true }> {
+  async logout(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true; logout_url: string | null }> {
     const header = req.headers.authorization;
     const reqWithCookies = req as Request & { cookies?: Record<string, string> };
     const cookieToken = reqWithCookies.cookies?.[SESSION_COOKIE_NAME];
@@ -314,6 +335,7 @@ export class AuthController {
     } else if (cookieToken) {
       token = cookieToken;
     }
+    // 1. Revoke the local session FIRST (server-side), then clear the cookie.
     if (token) {
       await this.prisma.$executeRawUnsafe(
         `UPDATE sessions SET revoked_at = NOW()
@@ -322,7 +344,13 @@ export class AuthController {
       );
     }
     res.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
-    return { ok: true };
+
+    // 2. Build the IdP RP-initiated logout URL from trusted config only.
+    //    post_logout_redirect_uri = WEB_ORIGIN + /login — never request input.
+    const postLogoutRedirectUri = new URL('/login', this.env.WEB_ORIGIN).toString();
+    const logoutUrl = await this.oidc.buildEndSessionUrl({ postLogoutRedirectUri });
+
+    return { ok: true, logout_url: logoutUrl };
   }
 
   // Current user. The bearer guard has already populated `user` (id, email,

@@ -172,6 +172,47 @@ export class OidcService {
     return result;
   }
 
+  // RP-initiated logout (OIDC RP-Initiated Logout 1.0) — provider-agnostic.
+  // Builds the IdP end-session URL from the SAME discovery doc used for login, so
+  // it works for Keycloak (dev) and Microsoft Entra (prod) without any
+  // provider-specific paths or params (ADR-0001).
+  //
+  // Returns null — never throws — when:
+  //   - the discovery doc has no `end_session_endpoint` (some IdPs omit it), or
+  //   - discovery is momentarily unreachable.
+  // The caller (logout) then falls back to a local-only logout. Local session
+  // teardown must never be blocked by an IdP URL we couldn't build.
+  //
+  // INC-008 / CWE-601: `postLogoutRedirectUri` MUST be built by the caller from
+  // trusted config only (WEB_ORIGIN + /login) — never from request input.
+  async buildEndSessionUrl(params: {
+    postLogoutRedirectUri: string;
+    logoutHint?: string;
+  }): Promise<string | null> {
+    let endSessionEndpoint: string | undefined;
+    try {
+      const disc = await this.getDiscovery();
+      endSessionEndpoint = disc.end_session_endpoint;
+    } catch (err) {
+      this.logger.warn(
+        `buildEndSessionUrl: discovery unreachable, falling back to local logout (${
+          err instanceof Error ? err.message : String(err)
+        })`,
+      );
+      return null;
+    }
+    if (!endSessionEndpoint) {
+      return null;
+    }
+    const url = new URL(endSessionEndpoint);
+    url.searchParams.set('client_id', this.env.OIDC_CLIENT_ID);
+    url.searchParams.set('post_logout_redirect_uri', params.postLogoutRedirectUri);
+    if (params.logoutHint) {
+      url.searchParams.set('logout_hint', params.logoutHint);
+    }
+    return url.toString();
+  }
+
   // Validate id_token signature + claims. Returns the canonical { sub, email, name }.
   async validateIdToken(idToken: string, expectedNonce: string): Promise<OidcClaims> {
     const disc = await this.getDiscovery();

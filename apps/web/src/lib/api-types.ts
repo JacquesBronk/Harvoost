@@ -25,6 +25,19 @@ export interface ScopeMeta {
   visible_projects: number; // -1 = unrestricted
 }
 
+/**
+ * INC-008 (GitHub #11): response from `POST /v1/auth/logout`. After revoking the
+ * local session, the backend returns the IdP RP-initiated logout URL so the web
+ * app can navigate the browser to the IdP `end_session_endpoint` and actually
+ * terminate the SSO session. `logout_url` is `null` when the IdP advertises no
+ * `end_session_endpoint` (or RP-initiated logout is otherwise unavailable), in
+ * which case the FE falls back to a local `/login` redirect.
+ */
+export interface LogoutResponse {
+  ok: boolean;
+  logout_url: string | null;
+}
+
 export interface ScopedList<T> {
   items: T[];
   scope_meta: ScopeMeta;
