@@ -5,9 +5,9 @@ mode: new_system
 parent_run_id: null
 prompt_summary: "Harvest-style time-tracking SaaS with tray app, RBAC (Admin/FinMgr/Mgr/Employee), clock-in with mood capture, manager dashboards, leave booking, two-stage approvals, scheduling, exception handling, financial dashboards, Excel export, manager chatbot, and autonomous weekly summaries with motivational quotes."
 created_at: 2026-05-22T13:15:14Z
-current_phase: post-release incident batch (INC-005 #8 → INC-006 #7 → INC-007 #9 → FEAT-002 #6)
+current_phase: post-release incident batch COMPLETE (INC-005 #8, INC-006 #7, INC-007 #9, FEAT-002 #6, INC-008 #11; #10 closed-as-fixed; #12 security backlog filed/open)
 deploy_target: Azure (South Africa North primary, South Africa West paired backup — Bicep authored, deployment deferred to Path 1)
-status: in_progress
+status: complete
 ---
 
 # Phase ledger
@@ -313,3 +313,5 @@ status: in_progress
 - 2026-05-24T14:48:00Z DOCUMENT: CHANGELOG.md [Unreleased]/Fixed — added the #11 entry (RP-initiated logout via discovered end_session_endpoint, provider-agnostic Keycloak+Entra, realm + Entra-prod note, security-driven no-id_token-storage + server-built redirect + graceful fallback, live-verified switch-users; documented the Keycloak confirm-click tradeoff). #10 fix already covered by the #6 entry's {data}-envelope reconciliation.
 - 2026-05-24T14:48:00Z all #11 acceptance criteria met: after Sign Out, the next login shows the IdP form + a different user can authenticate (live-proven Alice→Bob). Universal/Azure constraint satisfied (discovery-driven, no Keycloak-isms; Entra App Registration step documented). Scope guardrails honored: no migration, no regress INC-001..007/FEAT-001/FEAT-002, .github/ untouched.
 - 2026-05-24T14:48:00Z INC-008 status → awaiting_hitl (gate b: approve push to main, closes #11). Do NOT auto-push.
+- 2026-05-24T14:55:00Z gate b APPROVED. Committed the 14 RP-initiated-logout files + .hacktogether artifacts as 3bb4303, pushed 832c049..3bb4303 → main. .github/ excluded. Trailer "closes #11" auto-closed GitHub issue #11 (confirmed CLOSED). INC-008 CLOSED.
+- 2026-05-24T14:55:00Z ███ POST-RELEASE INCIDENT BATCH COMPLETE ███ All user-reported issues resolved: #8 (INC-005, rate-limit) 2d48097; #7 (INC-006, /admin/users roles) 3dd9cd4; #9 (INC-007, drill-in rollups + reconcile) 3623a02; #6 (FEAT-002, period-locking Option F + expansion) 832c049 (+636fad9/f81a90f); #10 (timesheet list envelope) closed-as-fixed-by-#6; #11 (INC-008, RP-initiated logout) 3bb4303. Opened #12 (security hardening backlog, LOW/pre-existing — intentionally OPEN). 8 commits total this session, .github/ excluded throughout (still needs the `workflow` OAuth scope). Final test tally: api 395 + web 180 + contract 151 + jobs 40 + db 21 + shared 101 = 888 pass + 1 known pre-existing shared fail (RbacScopeService empty-requesterId). All live-verified via Playwright chromium-live; no INC/FEAT regressions across the chain. run status → complete.
