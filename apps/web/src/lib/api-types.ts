@@ -142,6 +142,21 @@ export interface ProjectTask {
   is_active: boolean;
 }
 
+// FEAT-003 (GitHub #16) — task write-path bodies. POST requires `name`
+// (minLength 1) and defaults `is_billable` to true. PATCH is partial
+// (minProperties 1 server-side): only send the fields that changed — an empty
+// body is a 400.
+export interface CreateProjectTaskRequest {
+  name: string;
+  is_billable?: boolean;
+}
+
+export interface UpdateProjectTaskRequest {
+  name?: string;
+  is_billable?: boolean;
+  is_active?: boolean;
+}
+
 export interface TeamDashboardRow {
   user_id: string;
   display_name: string;

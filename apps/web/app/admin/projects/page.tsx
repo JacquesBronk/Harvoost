@@ -20,13 +20,22 @@ import {
   TR,
   useToast,
 } from '@harvoost/ui';
-import { Plus, Search, Trash2, UserPlus, Users } from 'lucide-react';
+import { ListChecks, Pencil, Plus, Search, Trash2, UserPlus, Users } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { PageHeader } from '@/components/PageHeader.js';
 import { ErrorBlock } from '@/components/ErrorBlock.js';
 import { ApiError, apiFetch, describeError } from '@/lib/api-client.js';
 import { useScope } from '@/lib/rbac.js';
+import {
+  adminTasksKey,
+  buildTaskPatch,
+  createProjectTask,
+  fetchAdminProjectTasks,
+  isTaskNameExistsError,
+  pickerTasksKey,
+  updateProjectTask,
+} from '@/lib/project-tasks.js';
 import type {
   AdminProject,
   BillingMode,
@@ -34,6 +43,7 @@ import type {
   OffsetPaginated,
   ProjectManagerAnchor,
   ProjectMember,
+  ProjectTask,
   User,
 } from '@/lib/api-types.js';
 
@@ -57,7 +67,7 @@ interface ProjectEditorState {
   error?: string;
 }
 
-type DrawerKind = 'members' | 'managers';
+type DrawerKind = 'members' | 'managers' | 'tasks';
 
 interface DrawerState {
   kind: DrawerKind;
@@ -348,6 +358,14 @@ export default function AdminProjectsPage() {
                       >
                         Managers
                       </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        iconLeft={<ListChecks className="h-3.5 w-3.5" aria-hidden="true" />}
+                        onClick={() => setDrawer({ kind: 'tasks', project })}
+                      >
+                        Tasks
+                      </Button>
                       {project.is_active ? (
                         <Button
                           variant="ghost"
@@ -496,16 +514,8 @@ export default function AdminProjectsPage() {
         {drawer ? (
           <ModalContent
             size="lg"
-            title={
-              drawer.kind === 'members'
-                ? `Members — ${drawer.project.name}`
-                : `Managers — ${drawer.project.name}`
-            }
-            description={
-              drawer.kind === 'members'
-                ? 'People assigned to this project. Removing a member preserves their historical time entries.'
-                : 'Managers anchored to this project. Anchored managers see all members and time entries.'
-            }
+            title={`${drawerTitle(drawer.kind)} — ${drawer.project.name}`}
+            description={drawerDescription(drawer.kind)}
             footer={
               <Button variant="primary" onClick={() => setDrawer(null)}>
                 Done
@@ -514,8 +524,10 @@ export default function AdminProjectsPage() {
           >
             {drawer.kind === 'members' ? (
               <MembersDrawer projectId={drawer.project.id} />
-            ) : (
+            ) : drawer.kind === 'managers' ? (
               <ManagersDrawer projectId={drawer.project.id} />
+            ) : (
+              <TasksDrawer projectId={drawer.project.id} />
             )}
           </ModalContent>
         ) : null}
@@ -813,6 +825,365 @@ function ManagersDrawer({ projectId }: { projectId: string }) {
               </Button>
             </li>
           ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function drawerTitle(kind: DrawerKind): string {
+  switch (kind) {
+    case 'members':
+      return 'Members';
+    case 'managers':
+      return 'Managers';
+    case 'tasks':
+      return 'Tasks';
+  }
+}
+
+function drawerDescription(kind: DrawerKind): string {
+  switch (kind) {
+    case 'members':
+      return 'People assigned to this project. Removing a member preserves their historical time entries.';
+    case 'managers':
+      return 'Managers anchored to this project. Anchored managers see all members and time entries.';
+    case 'tasks':
+      return 'Categories used to log time on this project. Archiving a task hides it from the time-entry picker but preserves historical entries.';
+  }
+}
+
+// FEAT-003 (GitHub #16) — per-task editing state held in the drawer. A task is
+// either being added (the top control) or edited inline (one row at a time).
+interface TaskEditState {
+  name: string;
+  isBillable: boolean;
+}
+
+const BILLABLE_OPTIONS = [
+  { value: 'true', label: 'Billable' },
+  { value: 'false', label: 'Non-billable' },
+];
+
+/**
+ * Admin Tasks drawer. Lists ALL tasks (active + archived) for the project via
+ * GET /v1/projects/{id}/tasks (no is_active filter). Supports add, inline
+ * rename + billability edit, archive, and reactivate. Every successful write
+ * invalidates the admin list key AND the time-entry picker key (AC-8) so the
+ * NewEntryForm / StartTimerControl pickers reflect the change.
+ */
+function TasksDrawer({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+
+  const [newName, setNewName] = useState('');
+  const [newBillable, setNewBillable] = useState(true);
+  const [addError, setAddError] = useState<string | undefined>(undefined);
+  // taskId currently in inline-edit mode → its draft values.
+  const [editing, setEditing] = useState<{ id: string; draft: TaskEditState } | null>(
+    null,
+  );
+  const [editError, setEditError] = useState<string | undefined>(undefined);
+
+  const tasksQuery = useQuery({
+    queryKey: adminTasksKey(projectId),
+    queryFn: () => fetchAdminProjectTasks(projectId),
+  });
+
+  // Invalidate the admin list AND the time-entry picker (both NewEntryForm and
+  // StartTimerControl read `['projects', projectId, 'tasks']`) after any write.
+  async function invalidateAll() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: adminTasksKey(projectId) }),
+      queryClient.invalidateQueries({ queryKey: pickerTasksKey(projectId) }),
+    ]);
+  }
+
+  // Map the API's duplicate-active-name error to a friendly sentence. The REAL
+  // envelope is HTTP 400 with top-level code VALIDATION_FAILED and the stable
+  // TASK_NAME_EXISTS code nested at details.code (clients/billable-rates
+  // precedent) — isTaskNameExistsError narrows for that plus the 422/409 +
+  // top-level-code forward-compat shapes.
+  function describeTaskError(err: unknown): string {
+    if (isTaskNameExistsError(err)) {
+      return 'A task with that name already exists in this project.';
+    }
+    return describeError(err);
+  }
+
+  const createMutation = useMutation({
+    mutationFn: () =>
+      createProjectTask(projectId, {
+        name: newName.trim(),
+        is_billable: newBillable,
+      }),
+    onSuccess: async (task) => {
+      await invalidateAll();
+      setNewName('');
+      setNewBillable(true);
+      setAddError(undefined);
+      toast.success('Task added', task.name);
+    },
+    onError: (err) => setAddError(describeTaskError(err)),
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: Parameters<typeof updateProjectTask>[2] }) =>
+      updateProjectTask(projectId, taskId, body),
+  });
+
+  function submitAdd() {
+    if (!newName.trim()) {
+      setAddError('Name is required.');
+      return;
+    }
+    setAddError(undefined);
+    createMutation.mutate();
+  }
+
+  async function submitEdit() {
+    if (!editing) return;
+    const current = tasks.find((t) => t.id === editing.id);
+    if (!current) {
+      setEditing(null);
+      return;
+    }
+    if (!editing.draft.name.trim()) {
+      setEditError('Name is required.');
+      return;
+    }
+    // Only send fields that changed — an empty PATCH is a 400 server-side. If
+    // nothing changed, just close the editor without a request.
+    const patch = buildTaskPatch(current, {
+      name: editing.draft.name,
+      isBillable: editing.draft.isBillable,
+    });
+    if (!patch) {
+      setEditing(null);
+      setEditError(undefined);
+      return;
+    }
+    try {
+      await updateMutation.mutateAsync({ taskId: editing.id, body: patch });
+      await invalidateAll();
+      toast.success('Task updated', editing.draft.name.trim());
+      setEditing(null);
+      setEditError(undefined);
+    } catch (err) {
+      setEditError(describeTaskError(err));
+    }
+  }
+
+  async function setActive(task: ProjectTask, isActive: boolean) {
+    try {
+      await updateMutation.mutateAsync({
+        taskId: task.id,
+        body: { is_active: isActive },
+      });
+      await invalidateAll();
+      toast.success(isActive ? 'Task reactivated' : 'Task archived', task.name);
+    } catch (err) {
+      // Reactivation can collide with an existing active name (AC-6).
+      toast.error(
+        isActive ? 'Could not reactivate task' : 'Could not archive task',
+        describeTaskError(err),
+      );
+    }
+  }
+
+  const tasks = tasksQuery.data?.data ?? [];
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Add task control */}
+      <div className="flex items-end gap-2">
+        <div className="flex-1">
+          <Input
+            label="Add task"
+            placeholder="e.g. Development"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                submitAdd();
+              }
+            }}
+          />
+        </div>
+        <div className="w-40">
+          <Select
+            label="Billing"
+            aria-label="Billing for new task"
+            value={String(newBillable)}
+            onChange={(e) => setNewBillable(e.target.value === 'true')}
+            options={BILLABLE_OPTIONS}
+          />
+        </div>
+        <Button
+          variant="primary"
+          disabled={!newName.trim() || createMutation.isPending}
+          loading={createMutation.isPending}
+          onClick={submitAdd}
+        >
+          Add
+        </Button>
+      </div>
+      {addError ? (
+        <p role="alert" className="text-xs text-danger-600">
+          {addError}
+        </p>
+      ) : null}
+
+      {tasksQuery.isLoading ? (
+        <LoadingSpinner size="sm" label="Loading tasks" />
+      ) : tasksQuery.isError ? (
+        <ErrorBlock error={tasksQuery.error} onRetry={() => tasksQuery.refetch()} />
+      ) : tasks.length === 0 ? (
+        <EmptyState
+          title="No tasks yet"
+          description="Add a task above so time can be categorized on this project."
+        />
+      ) : (
+        <ul className="divide-y divide-neutral-100 rounded-md border border-neutral-200">
+          {tasks.map((task) => {
+            const isEditing = editing?.id === task.id;
+            return (
+              <li key={task.id} className="px-3 py-2">
+                {isEditing && editing ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-end gap-2">
+                      <div className="flex-1">
+                        <Input
+                          label="Task name"
+                          aria-label={`Rename ${task.name}`}
+                          value={editing.draft.name}
+                          onChange={(e) =>
+                            setEditing((p) =>
+                              p ? { ...p, draft: { ...p.draft, name: e.target.value } } : p,
+                            )
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              void submitEdit();
+                            }
+                          }}
+                        />
+                      </div>
+                      <div className="w-40">
+                        <Select
+                          label="Billing"
+                          aria-label={`Billing for ${task.name}`}
+                          value={String(editing.draft.isBillable)}
+                          onChange={(e) =>
+                            setEditing((p) =>
+                              p
+                                ? {
+                                    ...p,
+                                    draft: {
+                                      ...p.draft,
+                                      isBillable: e.target.value === 'true',
+                                    },
+                                  }
+                                : p,
+                            )
+                          }
+                          options={BILLABLE_OPTIONS}
+                        />
+                      </div>
+                    </div>
+                    {editError ? (
+                      <p role="alert" className="text-xs text-danger-600">
+                        {editError}
+                      </p>
+                    ) : null}
+                    <div className="flex justify-end gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setEditing(null);
+                          setEditError(undefined);
+                        }}
+                        disabled={updateMutation.isPending}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        loading={updateMutation.isPending}
+                        disabled={!editing.draft.name.trim()}
+                        onClick={() => void submitEdit()}
+                      >
+                        Save
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-neutral-900">
+                        {task.name}
+                      </span>
+                      <Badge tone={task.is_billable ? 'brand' : 'neutral'}>
+                        {task.is_billable ? 'Billable' : 'Non-billable'}
+                      </Badge>
+                      {task.is_active ? (
+                        <Badge tone="success" dot>
+                          Active
+                        </Badge>
+                      ) : (
+                        <Badge tone="neutral" dot>
+                          Archived
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        iconLeft={<Pencil className="h-3.5 w-3.5" aria-hidden="true" />}
+                        aria-label={`Edit ${task.name}`}
+                        onClick={() => {
+                          setEditing({
+                            id: task.id,
+                            draft: { name: task.name, isBillable: task.is_billable },
+                          });
+                          setEditError(undefined);
+                        }}
+                        disabled={updateMutation.isPending}
+                      >
+                        Edit
+                      </Button>
+                      {task.is_active ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`Archive ${task.name}`}
+                          onClick={() => void setActive(task, false)}
+                          disabled={updateMutation.isPending}
+                        >
+                          Archive
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`Reactivate ${task.name}`}
+                          onClick={() => void setActive(task, true)}
+                          disabled={updateMutation.isPending}
+                        >
+                          Reactivate
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
