@@ -2191,6 +2191,117 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
 
+  /v1/reports/employees/{userId}/rollup:
+    get:
+      tags: [Reports]
+      summary: Employee drill-in rollup (per-user hours breakdown for a date range)
+      description: |
+        Powers the `/dashboard/employees/:id` drill-in. Returns the selected user's hours
+        broken down by project, a per-day timeline, an out-of-scope summary (projects the
+        requester cannot see but the subject logged time against), and the user's exceptions
+        over the range.
+
+        **Date range:** the single required `date_range` query parameter takes the form
+        `YYYY-MM-DD/YYYY-MM-DD` (inclusive local dates). A missing or malformed value returns
+        400 `VALIDATION_FAILED`. This was the INC-007 root cause — the drill-in page fired the
+        request with no `date_range` and got a 400; the page now sends the current ISO week.
+
+        **Response shape:** a single rollup object (NOT a `{ items }` envelope). `out_of_scope_*`
+        summarise projects outside the requester's RBAC scope without leaking their names.
+      operationId: getEmployeeRollup
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/DateRange'
+      responses:
+        '200':
+          description: Employee rollup for the requested date range.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeRollup' }
+              example:
+                user:
+                  id: '18'
+                  display_name: Bob Example
+                  email: bob@example.com
+                  timezone: Africa/Johannesburg
+                date_range: { from: 2026-05-18, to: 2026-05-24 }
+                hours_by_project:
+                  - project_id: '42'
+                    project_name: Atlas
+                    hours: 24
+                  - project_id: '43'
+                    project_name: Internal Ops
+                    hours: 14.5
+                out_of_scope_project_count: 1
+                out_of_scope_hours: 3.5
+                timeline:
+                  - { day: 2026-05-18, hours: 8 }
+                  - { day: 2026-05-19, hours: 7.5 }
+                exceptions:
+                  - id: '901'
+                    type: MISSED_PUNCH
+                    local_date: 2026-05-19
+                    status: open
+                    details: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/reports/projects/{projectId}/rollup:
+    get:
+      tags: [Reports]
+      summary: Project drill-in rollup (per-project hours breakdown for a date range)
+      description: |
+        Powers the `/dashboard/projects/:id` drill-in. Returns the selected project's total and
+        billable hours for the range, broken down by member and by task, plus the project's
+        billing/budget context.
+
+        **Date range:** the single required `date_range` query parameter takes the form
+        `YYYY-MM-DD/YYYY-MM-DD` (inclusive local dates). A missing or malformed value returns
+        400 `VALIDATION_FAILED` — the INC-007 drill-in fix sends the current ISO week.
+
+        **Response shape:** a single rollup object (NOT a `{ items }` envelope). `budget` is
+        optional/nullable; clients must tolerate its absence.
+      operationId: getProjectRollup
+      parameters:
+        - $ref: '#/components/parameters/ProjectIdPath'
+        - $ref: '#/components/parameters/DateRange'
+      responses:
+        '200':
+          description: Project rollup for the requested date range.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectRollup' }
+              example:
+                project:
+                  id: '42'
+                  name: Atlas
+                  client_name: Acme Corp
+                  billing_mode: hourly
+                  fixed_fee_amount: null
+                  currency: ZAR
+                  hours_budget: 200
+                date_range: { from: 2026-05-18, to: 2026-05-24 }
+                total_hours: 120
+                billable_hours: 100
+                hours_by_member:
+                  - { user_id: '18', display_name: Bob Example, hours: 80 }
+                  - { user_id: '19', display_name: Carol Example, hours: 40 }
+                hours_by_task:
+                  - { task_id: '7', task_name: Build, hours: 90 }
+                  - { task_id: null, task_name: Unassigned, hours: 30 }
+                budget:
+                  hours_budget: 200
+                  hours_used: 120
+                  hours_remaining: 80
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
   # ============================================================
   # RATES (cost + billable; effective-dated; Admin/FinMgr only)
   # ============================================================
@@ -2847,8 +2958,9 @@ components:
         pattern: '^\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}$'
       description: |
         Inclusive local-date range in the form `YYYY-MM-DD/YYYY-MM-DD` (start/end). Used by the
-        GET report dashboards (`team-dashboard`, `profitability`). A malformed value returns 400
-        `VALIDATION_FAILED`.
+        GET report dashboards (`team-dashboard`, `profitability`) and the report drill-in
+        rollups (`employees/{userId}/rollup`, `projects/{projectId}/rollup`). A malformed value
+        returns 400 `VALIDATION_FAILED`.
     UserIdPath:
       in: path
       name: user_id
@@ -3897,6 +4009,160 @@ components:
         margin_pct: { type: number, format: float }
         currency: { type: string }
       required: [project_id, project_name, hours, revenue, cost, margin, margin_pct, currency]
+
+    EmployeeRollup:
+      type: object
+      description: |
+        Employee drill-in rollup body for `GET /v1/reports/employees/{userId}/rollup`
+        (powers `/dashboard/employees/:id`). A single object (NOT a `{ items }` envelope).
+        IDs are returned as strings. Hours-only — carries no cost / billable-rate fields.
+        INC-007: this schema was previously undeclared (the endpoint sat in the contract
+        test's KNOWN_SPEC_GAP), which let a FE↔API field drift crash the page uncaught.
+      properties:
+        user:
+          type: object
+          description: The subject user the rollup is for.
+          properties:
+            id: { type: string }
+            display_name: { type: string }
+            email: { type: string, format: email }
+            timezone:
+              type: string
+              description: IANA timezone string (e.g. `Africa/Johannesburg`).
+          required: [id, display_name, email, timezone]
+        date_range:
+          type: object
+          description: The inclusive local-date range the rollup covers (echoes the query).
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+          required: [from, to]
+        hours_by_project:
+          type: array
+          description: Hours the subject logged per project the requester can see.
+          items:
+            type: object
+            properties:
+              project_id: { type: string }
+              project_name: { type: string }
+              hours: { type: number, format: float }
+            required: [project_id, project_name, hours]
+        out_of_scope_project_count:
+          type: integer
+          description: Count of projects the subject logged time against but the requester cannot see (names withheld).
+        out_of_scope_hours:
+          type: number
+          format: float
+          description: Total hours against out-of-scope projects (aggregate only — no per-project breakdown).
+        timeline:
+          type: array
+          description: Per-day hours total across the range.
+          items:
+            type: object
+            properties:
+              day: { type: string, format: date }
+              hours: { type: number, format: float }
+            required: [day, hours]
+        exceptions:
+          type: array
+          description: The subject's exceptions over the range.
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              type: { type: string }
+              local_date: { type: string, format: date }
+              status: { type: string }
+              details:
+                oneOf:
+                  - { type: object, additionalProperties: true }
+                  - { type: 'null' }
+            required: [id, type, local_date, status]
+      required: [user, date_range, hours_by_project, out_of_scope_project_count, out_of_scope_hours, timeline, exceptions]
+
+    ProjectRollup:
+      type: object
+      description: |
+        Project drill-in rollup body for `GET /v1/reports/projects/{projectId}/rollup`
+        (powers `/dashboard/projects/:id`). A single object (NOT a `{ items }` envelope).
+        IDs are returned as strings. `budget` is optional/nullable — clients tolerate absence.
+        INC-007: this schema was previously undeclared (the endpoint sat in the contract
+        test's KNOWN_SPEC_GAP), which let a FE↔API field drift crash the page uncaught.
+      properties:
+        project:
+          type: object
+          description: The project the rollup is for, with its billing/budget context.
+          properties:
+            id: { type: string }
+            name: { type: string }
+            client_name:
+              oneOf:
+                - { type: string }
+                - { type: 'null' }
+            billing_mode: { $ref: '#/components/schemas/BillingMode' }
+            fixed_fee_amount:
+              oneOf:
+                - { type: number, format: float }
+                - { type: 'null' }
+            currency: { type: string }
+            hours_budget:
+              oneOf:
+                - { type: number, format: float }
+                - { type: 'null' }
+          required: [id, name, billing_mode, currency]
+        date_range:
+          type: object
+          description: The inclusive local-date range the rollup covers (echoes the query).
+          properties:
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+          required: [from, to]
+        total_hours: { type: number, format: float }
+        billable_hours: { type: number, format: float }
+        hours_by_member:
+          type: array
+          description: Hours per member who logged time against the project in the range.
+          items:
+            type: object
+            properties:
+              user_id: { type: string }
+              display_name: { type: string }
+              hours: { type: number, format: float }
+            required: [user_id, display_name, hours]
+        hours_by_task:
+          type: array
+          description: Hours per task; `task_id` is null for the unassigned/default bucket.
+          items:
+            type: object
+            properties:
+              task_id:
+                oneOf:
+                  - { type: string }
+                  - { type: 'null' }
+              task_name: { type: string }
+              hours: { type: number, format: float }
+            required: [task_name, hours]
+        budget:
+          description: |
+            Optional/nullable budget summary. Clients must tolerate its absence (omitted or
+            null when the project carries no `hours_budget`).
+          oneOf:
+            - type: object
+              properties:
+                hours_budget:
+                  oneOf:
+                    - { type: number, format: float }
+                    - { type: 'null' }
+                hours_used:
+                  type: number
+                  format: float
+                hours_remaining:
+                  oneOf:
+                    - { type: number, format: float }
+                    - { type: 'null' }
+              required: [hours_budget]
+            - { type: 'null' }
+      required: [project, date_range, total_hours, billable_hours, hours_by_member, hours_by_task]
 
     # ---------- Rates ----------
     CostRate:

@@ -158,7 +158,7 @@ describe('profitability — admin/finmgr only', () => {
   });
 });
 
-describe('employees rollup — RBAC + Other-projects bucketing', () => {
+describe('employees rollup — RBAC + out-of-scope summarisation', () => {
   it('asserts canSeeUser before running queries', async () => {
     const rbac = makeRbacStub({ canSeeUser: false });
     const ctrl = new ReportsController(
@@ -172,7 +172,7 @@ describe('employees rollup — RBAC + Other-projects bucketing', () => {
     ).rejects.toBeInstanceOf(RbacForbiddenError);
   });
 
-  it('buckets non-visible projects under Other projects (N)', async () => {
+  it('lists only in-scope projects and surfaces out-of-scope as top-level numbers', async () => {
     const prisma = makePrismaStub({
       // Header
       'SELECT id, display_name, email, timezone': [
@@ -197,11 +197,52 @@ describe('employees rollup — RBAC + Other-projects bucketing', () => {
       rbac as any,
     );
     const out = await ctrl.employeeRollup(actor, '2', '2026-05-01/2026-05-31');
-    // 10 is visible; 99 + 88 are not, so they collapse into "Other projects (2)".
+    // Only the real in-scope project remains in the array — NO synthetic
+    // null-id "Other projects (N)" row.
     expect(out.hours_by_project).toEqual([
       { project_id: '10', project_name: 'Visible-A', hours: 4 },
-      { project_id: null, project_name: 'Other projects (2)', hours: 5 },
     ]);
+    expect(out.hours_by_project.some((p) => p.project_id === null)).toBe(false);
+    // 99 + 88 (3 + 2 hours) collapse into the top-level counts.
+    expect(out.out_of_scope_project_count).toBe(2);
+    expect(out.out_of_scope_hours).toBe(5);
+    expect(typeof out.out_of_scope_project_count).toBe('number');
+    expect(typeof out.out_of_scope_hours).toBe('number');
+    // Unchanged passthrough fields stay intact.
+    expect(out.user.display_name).toBe('Bob');
+    expect(out.timeline).toEqual([{ day: '2026-05-15', hours: 9 }]);
+    expect(out.exceptions).toEqual([]);
+  });
+
+  it('emits zeroed out-of-scope counts and no null-id row when nothing is out of scope', async () => {
+    const prisma = makePrismaStub({
+      'SELECT id, display_name, email, timezone': [
+        { id: 2, display_name: 'Bob', email: 'bob@example.com', timezone: 'Africa/Johannesburg' },
+      ],
+      'JOIN projects p ON p.id = te.project_id': [
+        { project_id: '10', project_name: 'Visible-A', hours: 4 },
+        { project_id: '20', project_name: 'Visible-B', hours: 3 },
+      ],
+      'GROUP BY day': [{ day: '2026-05-15', hours: 7 }],
+      'FROM exceptions': [],
+    });
+    // Both projects are visible.
+    const rbac = makeRbacStub({ visibleProjectIds: ['10', '20'], visibleUserIds: ['1', '2'] });
+    const ctrl = new ReportsController(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      prisma as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rbac as any,
+    );
+    const out = await ctrl.employeeRollup(actor, '2', '2026-05-01/2026-05-31');
+    expect(out.hours_by_project).toEqual([
+      { project_id: '10', project_name: 'Visible-A', hours: 4 },
+      { project_id: '20', project_name: 'Visible-B', hours: 3 },
+    ]);
+    expect(out.hours_by_project.some((p) => p.project_id === null)).toBe(false);
+    // Present-but-zero, not omitted.
+    expect(out).toHaveProperty('out_of_scope_project_count', 0);
+    expect(out).toHaveProperty('out_of_scope_hours', 0);
   });
 });
 
@@ -226,7 +267,7 @@ describe('project rollup — RBAC + budget calc', () => {
         { id: 10, name: 'Proj-A', billing_mode: 'hourly', fixed_fee_amount: null, currency: 'EUR', hours_budget: 100, client_name: 'Acme' },
       ],
       // Total hours
-      'COALESCE(SUM(EXTRACT(EPOCH': [{ total_hours: 25 }],
+      'COALESCE(SUM(EXTRACT(EPOCH': [{ total_hours: 25, billable_hours: 20 }],
       // Hours by member
       'JOIN users u ON u.id = te.user_id': [{ user_id: '5', display_name: 'Carol', hours: 25 }],
       // Hours by task
@@ -246,5 +287,48 @@ describe('project rollup — RBAC + budget calc', () => {
       hours_remaining: 75,
       percent_used: 25,
     });
+  });
+
+  it('exposes top-level billable_hours equal to the billable subset of total_hours', async () => {
+    const prisma = makePrismaStub({
+      'SELECT p.id, p.name, p.billing_mode': [
+        { id: 10, name: 'Proj-A', billing_mode: 'hourly', fixed_fee_amount: null, currency: 'EUR', hours_budget: null, client_name: 'Acme' },
+      ],
+      // total_hours = 25, of which 18 are billable.
+      'COALESCE(SUM(EXTRACT(EPOCH': [{ total_hours: 25, billable_hours: 18 }],
+      'JOIN users u ON u.id = te.user_id': [{ user_id: '5', display_name: 'Carol', hours: 25 }],
+      'LEFT JOIN project_tasks': [{ task_id: null, task_name: '(no task)', hours: 25 }],
+    });
+    const rbac = makeRbacStub({ unrestricted: true });
+    const ctrl = new ReportsController(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      prisma as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rbac as any,
+    );
+    const out = await ctrl.projectRollup(admin, '10', '2026-05-01/2026-05-31');
+    expect(out.total_hours).toBe(25);
+    expect(out).toHaveProperty('billable_hours', 18);
+    expect(typeof out.billable_hours).toBe('number');
+  });
+
+  it('returns billable_hours 0 when there are no billable entries', async () => {
+    const prisma = makePrismaStub({
+      'SELECT p.id, p.name, p.billing_mode': [
+        { id: 10, name: 'Proj-A', billing_mode: 'non_billable', fixed_fee_amount: null, currency: 'EUR', hours_budget: null, client_name: 'Acme' },
+      ],
+      'COALESCE(SUM(EXTRACT(EPOCH': [{ total_hours: 12, billable_hours: 0 }],
+      'JOIN users u ON u.id = te.user_id': [{ user_id: '5', display_name: 'Carol', hours: 12 }],
+      'LEFT JOIN project_tasks': [{ task_id: null, task_name: '(no task)', hours: 12 }],
+    });
+    const rbac = makeRbacStub({ unrestricted: true });
+    const ctrl = new ReportsController(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      prisma as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rbac as any,
+    );
+    const out = await ctrl.projectRollup(admin, '10', '2026-05-01/2026-05-31');
+    expect(out.billable_hours).toBe(0);
   });
 });

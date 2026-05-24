@@ -12,6 +12,19 @@
 // list-item `roles` field-level drift that crashed /admin/users is caught at
 // build time too — see the entry at the end of LOAD_BEARING.
 //
+// INC-007 extends it again to the two report rollup drill-in endpoints
+// (`GET /v1/reports/employees/{param}/rollup`,
+//  `GET /v1/reports/projects/{param}/rollup`). These had sat in KNOWN_SPEC_GAP
+// since v0.1.0 ("spec not yet updated") — the OpenAPI spec never declared their
+// response shapes, which is exactly why a FE↔API drift on them went uncaught and
+// crashed the drill-in pages. They are now spec'd (single rollup objects, NOT
+// `{ items }` envelopes), implemented, and FE-reconciled, so they move OUT of
+// KNOWN_SPEC_GAP and INTO LOAD_BEARING with `shape: 'object'` (the success schema
+// IS the rollup resource — no envelope key). `reads` lists the top-level fields
+// the drill-in pages consume; the test FAILS if the spec ever drops one again.
+// NOTE: keys are stored with `{param}` because loadSpec()/scan-frontend both
+// normalise every path interpolation to `{param}` (see normaliseSpecPath).
+//
 // Three allowlists carry pre-existing, OUT-OF-SCOPE debt on endpoints the
 // INC-004 lanes are NOT touching, so the suite stays green for the hotfix while
 // still flagging the debt in the log. NEW drift on any other endpoint still
@@ -111,6 +124,32 @@ export const LOAD_BEARING: EnvelopeExpectation[] = [
       'roles',
     ],
   },
+  {
+    // INC-007: /dashboard/employees/:id drill-in. The 200 response is a single
+    // EmployeeRollup object (NOT an `{ items }` / `{ data }` envelope), so
+    // shape 'object' + empty envelopeKey resolves the rollup schema's own
+    // top-level props. `reads` are the top-level fields the page consumes
+    // (`user`, off which the page reads `display_name`; the project breakdown;
+    // and the out-of-scope summary). FAILS the build if the spec drops a rollup
+    // field the page reads — it would have failed against the pre-INC-007 spec,
+    // which declared NO response schema at all for this endpoint.
+    key: 'GET /v1/reports/employees/{param}/rollup',
+    envelopeKey: '',
+    shape: 'object',
+    reads: ['user', 'hours_by_project', 'out_of_scope_project_count', 'out_of_scope_hours'],
+  },
+  {
+    // INC-007: /dashboard/projects/:id drill-in. The 200 response is a single
+    // ProjectRollup object (NOT an envelope), so shape 'object' + empty
+    // envelopeKey resolves the rollup schema's own top-level props. `reads` are
+    // the top-level fields the page consumes (`project`, off which the page reads
+    // `name` / `hours_budget`; the totals; and the per-member breakdown). FAILS
+    // the build if the spec drops a rollup field the page reads.
+    key: 'GET /v1/reports/projects/{param}/rollup',
+    envelopeKey: '',
+    shape: 'object',
+    reads: ['project', 'total_hours', 'billable_hours', 'hours_by_member'],
+  },
 ];
 
 /**
@@ -132,17 +171,14 @@ export const KNOWN_PARAM_DRIFT: Record<string, string[]> = {
  * FE-consumed endpoints that are registered as NestJS routes but are not (yet)
  * declared in openapi.yaml, and are OUTSIDE the INC-004 pinned contract (no row
  * in HOTFIX_PLAN). The 404-guard still applies (the routes exist); only the
- * spec-declaration assertion is relaxed. Documents spec debt for a follow-up
- * that folds the report drill-in endpoints into the spec.
+ * spec-declaration assertion is relaxed.
+ *
+ * INC-007 closed the loop on the two report drill-in rollups that previously
+ * lived here ("spec not yet updated") — they are now fully spec'd + in
+ * LOAD_BEARING above, so they have been REMOVED from this list. The array is now
+ * empty: there is no remaining FE-consumed endpoint missing a spec entry.
  */
-export const KNOWN_SPEC_GAP: string[] = [
-  // dashboard/projects/[projectId] drill-in — backend route exists
-  // (@Get('projects/:projectId/rollup') on v1/reports), spec not yet updated.
-  'GET /v1/reports/projects/{param}/rollup',
-  // dashboard/employees/[userId] drill-in — backend route exists
-  // (@Get('employees/:userId/rollup') on v1/reports), spec not yet updated.
-  'GET /v1/reports/employees/{param}/rollup',
-];
+export const KNOWN_SPEC_GAP: string[] = [];
 
 /**
  * FE-consumed endpoints declared in openapi.yaml that have NO registered NestJS

@@ -379,9 +379,11 @@ export class ReportsController {
 
   // GET /v1/reports/employees/:userId/rollup?date_range=...
   //
-  // Per-employee rollup intersected with the actor's RBAC scope. Projects the
-  // actor cannot see are collapsed into a single { project_id: null,
-  // project_name: 'Other projects (N)', hours } bucket per REQUIREMENTS F3.2.
+  // Per-employee rollup intersected with the actor's RBAC scope. `hours_by_project`
+  // lists ONLY the real in-scope projects; projects the actor cannot see are NOT
+  // listed individually but summarised in the top-level `out_of_scope_project_count`
+  // + `out_of_scope_hours` fields (always emitted, 0 when none) per the pinned
+  // drill-in contract (INC-007 FE↔API reconciliation; F3.2 privacy intent kept).
   @Get('employees/:userId/rollup')
   async employeeRollup(
     @CurrentUser() actor: CurrentUserPayload,
@@ -424,7 +426,11 @@ export class ReportsController {
     );
 
     const visibleSet = visibleProjectIds ? new Set(visibleProjectIds.map(String)) : null;
-    const hoursByProject: Array<{ project_id: string | null; project_name: string; hours: number }> = [];
+    // `hours_by_project` carries ONLY the real in-scope projects. Projects the
+    // actor cannot see are NOT folded into a synthetic row anymore; instead the
+    // count + summed hours surface as top-level `out_of_scope_*` fields so the
+    // drill-in page can render the in-scope breakdown without a null-id entry.
+    const hoursByProject: Array<{ project_id: string; project_name: string; hours: number }> = [];
     let otherHours = 0;
     let otherCount = 0;
     for (const r of projectRows) {
@@ -436,13 +442,6 @@ export class ReportsController {
         otherHours += hours;
         otherCount += 1;
       }
-    }
-    if (otherCount > 0) {
-      hoursByProject.push({
-        project_id: null,
-        project_name: `Other projects (${otherCount})`,
-        hours: Number(otherHours.toFixed(2)),
-      });
     }
 
     // Per-day timeline.
@@ -489,6 +488,10 @@ export class ReportsController {
       },
       date_range: { from, to },
       hours_by_project: hoursByProject,
+      // Always present (0 when nothing is out of scope) — replaces the old
+      // synthetic "Other projects (N)" row that used to live in hours_by_project.
+      out_of_scope_project_count: otherCount,
+      out_of_scope_hours: Number(otherHours.toFixed(2)),
       timeline: timeline.map((t) => ({
         day: String(t.day),
         hours: Number(t.hours ?? 0),
@@ -551,8 +554,11 @@ export class ReportsController {
       totalParams.push(visibleUserIds);
       totalUserFilter = ` AND te.user_id = ANY($${totalParams.length}::bigint[])`;
     }
-    const totalRows = await this.prisma.$queryRawUnsafe<Array<{ total_hours: unknown }>>(
-      `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (te.end_at - te.start_at)) / 3600.0), 0)::numeric(10,2) AS total_hours
+    const totalRows = await this.prisma.$queryRawUnsafe<Array<{ total_hours: unknown; billable_hours: unknown }>>(
+      `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (te.end_at - te.start_at)) / 3600.0), 0)::numeric(10,2) AS total_hours,
+              COALESCE(SUM(CASE WHEN te.billable
+                                THEN EXTRACT(EPOCH FROM (te.end_at - te.start_at)) / 3600.0
+                                ELSE 0 END), 0)::numeric(10,2) AS billable_hours
        FROM time_entries te
        WHERE te.project_id = $1::bigint
          AND te.start_at >= $2::date
@@ -561,6 +567,7 @@ export class ReportsController {
       ...totalParams,
     );
     const totalHours = Number(totalRows[0]?.total_hours ?? 0);
+    const billableHours = Number(totalRows[0]?.billable_hours ?? 0);
 
     // Hours by member (RBAC-filtered).
     const memberRows = await this.prisma.$queryRawUnsafe<
@@ -610,6 +617,9 @@ export class ReportsController {
       },
       date_range: { from, to },
       total_hours: totalHours,
+      // Billable subset of total_hours over the same RBAC-filtered range
+      // (te.billable = true). Always emitted; 0 when no billable entries.
+      billable_hours: billableHours,
       hours_by_member: memberRows.map((r) => ({
         user_id: String(r.user_id),
         display_name: String(r.display_name),

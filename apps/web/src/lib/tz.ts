@@ -109,3 +109,25 @@ export function currentMonthRange(zone: string = viewerTimeZone()): {
   const to = now.toISODate() ?? from;
   return { from, to: to < from ? from : to };
 }
+
+/**
+ * INC-007: the current ISO week as an inclusive local-date range
+ * (Monday → Sunday) in `zone`. The drill-in pages
+ * (`/dashboard/employees/:id`, `/dashboard/projects/:id`) default to this so
+ * the rollup endpoints get the required `date_range=YYYY-MM-DD/YYYY-MM-DD`
+ * param. Mirrors the `this_week` branch the team dashboard
+ * (apps/web/app/dashboard/page.tsx) builds inline: `now.startOf('week')` is the
+ * ISO Monday and `+6 days` is the inclusive Sunday.
+ */
+export function currentIsoWeekRange(zone: string = viewerTimeZone()): {
+  from: string;
+  to: string;
+} {
+  const now = DateTime.now().setZone(zone);
+  const start = now.startOf('week'); // ISO Mon
+  const lastDay = start.plus({ days: 6 }); // Sun, inclusive
+  return {
+    from: start.toISODate() ?? '',
+    to: lastDay.toISODate() ?? '',
+  };
+}

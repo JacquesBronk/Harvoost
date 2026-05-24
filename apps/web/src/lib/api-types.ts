@@ -143,13 +143,31 @@ export interface TeamDashboardRow {
   overtime_count: number;
 }
 
+/**
+ * INC-007: `GET /v1/reports/projects/:projectId/rollup` returns a NESTED shape —
+ * project metadata lives under `project` (not flat), member hours under
+ * `hours_by_member` (was `members`), and the budget under `project.hours_budget`
+ * (was top-level `hours_budget`). The FE previously read the flat fields the API
+ * no longer emits, so `members.map` threw "Cannot read properties of undefined
+ * (reading 'map')". `total_hours` / `billable_hours` remain top-level.
+ */
 export interface ProjectRollupRow {
-  project_id: string;
-  project_name: string;
+  project: {
+    id: string;
+    name: string;
+    client_name: string | null;
+    billing_mode: string;
+    fixed_fee_amount: number | null;
+    currency: string;
+    hours_budget: number | null;
+  };
+  date_range: { from: string; to: string };
   total_hours: number;
   billable_hours: number;
-  hours_budget?: number | null;
-  members: Array<{ user_id: string; display_name: string; hours: number }>;
+  hours_by_member: Array<{ user_id: string; display_name: string; hours: number }>;
+  hours_by_task: Array<{ task_id: string | null; task_name: string; hours: number }>;
+  // Present when `project.hours_budget` is set; treat as optional everywhere.
+  budget?: { hours_budget: number | null; [key: string]: unknown };
 }
 
 export interface FinancialProjectRow {
