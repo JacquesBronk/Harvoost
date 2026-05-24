@@ -23,10 +23,13 @@ export class ApiError extends Error {
   public readonly status: number;
   public readonly code: string;
   public readonly details?: unknown;
-  // INC-003: for 429 responses, the throttler's retry hint in milliseconds.
-  // The NestJS named-bucket throttler emits `Retry-After-auth` (seconds), NOT a
-  // plain `Retry-After` (confirmed live). Consumers (e.g. useCurrentUser's
-  // retryDelay) honor this to back off instead of hammering the bucket.
+  // INC-003 / INC-005: for 429 responses, the throttler's retry hint in
+  // milliseconds. The NestJS named-bucket throttler emits a bucket-suffixed
+  // `Retry-After-<bucket>` (seconds), NOT a plain `Retry-After` (confirmed
+  // live): `Retry-After-global` for throttled reads, `Retry-After-auth` for
+  // login/callback. Consumers (useCurrentUser's retryDelay AND the global
+  // query-client retryDelay) honor this to back off instead of hammering the
+  // bucket. See parseRetryAfterMs for the header fallback order.
   public readonly retryAfterMs?: number;
 
   constructor(
@@ -44,14 +47,22 @@ export class ApiError extends Error {
 }
 
 /**
- * INC-003: parse the throttler's retry hint from a 429 response's headers.
- * The named-bucket NestJS throttler emits `Retry-After-auth: <seconds>` rather
- * than a plain `Retry-After`, so we read the named header first and fall back
- * to the standard one. Returns the delay in milliseconds, or undefined if no
- * usable hint is present.
+ * INC-003 / INC-005: parse the throttler's retry hint from a 429 response's
+ * headers. The named-bucket NestJS throttler emits a bucket-suffixed
+ * `Retry-After-<bucket>: <seconds>` rather than a plain `Retry-After`, and the
+ * suffix is the bucket that blocked. After the INC-005 backend fix, throttled
+ * READS are blocked by the per-principal `global` bucket → `Retry-After-global`,
+ * while throttled login/callback are blocked by the brute-force `auth` bucket →
+ * `Retry-After-auth`. We read the named headers in order and fall back to the
+ * standard `Retry-After`. The broad fallback list is deliberately robust to
+ * bucket renames. (The backend CORS-exposes all three so the browser can read
+ * them.) Returns the delay in milliseconds, or undefined if no usable hint.
  */
 export function parseRetryAfterMs(headers: Headers): number | undefined {
-  const raw = headers.get('Retry-After-auth') ?? headers.get('Retry-After');
+  const raw =
+    headers.get('Retry-After-global') ??
+    headers.get('Retry-After-auth') ??
+    headers.get('Retry-After');
   if (raw == null) return undefined;
   const seconds = Number(raw.trim());
   if (!Number.isFinite(seconds) || seconds < 0) return undefined;
@@ -146,8 +157,10 @@ export async function apiFetch<T = unknown>(
         message: envelope?.message ?? `Request failed (${response.status}).`,
         details: envelope?.details,
       },
-      // INC-003: capture the throttler's retry hint on 429 so callers can back
-      // off instead of looping. Header is `Retry-After-auth` (seconds).
+      // INC-003 / INC-005: capture the throttler's retry hint on 429 so callers
+      // can back off instead of looping. Header is a bucket-suffixed
+      // `Retry-After-<bucket>` (seconds): `Retry-After-global` for reads,
+      // `Retry-After-auth` for login/callback (see parseRetryAfterMs).
       response.status === 429
         ? { retryAfterMs: parseRetryAfterMs(response.headers) }
         : undefined,

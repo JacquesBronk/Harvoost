@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { AuthController } from '../../src/auth/auth.controller';
 import { ChatbotController } from '../../src/chatbot/chatbot.controller';
+import { ProjectsController } from '../../src/projects/projects.controller';
+import { TimeEntriesController } from '../../src/time-entries/time-entries.controller';
 
 // Finding 4 — Throttle decorators applied to AuthController and ChatbotController.postMessage.
 //
@@ -124,5 +126,31 @@ describe('Throttle/SkipThrottle — INC-003 (/me off the auth brute-force bucket
     const authOnClass = readNamedLimiter(AuthController, 'auth');
     expect(authOnClass.limit).toBe(5);
     expect(authOnClass.ttl).toBe(60_000);
+  });
+});
+
+// INC-005 (issue #8) regression — the `auth` 5/60s bucket silently applied to
+// EVERY route (smallest bucket in forRoot binds all). After Fix A1 the `auth`
+// and `chatbot` buckets are OPT-IN: a route is exempt unless it carries the
+// bucket's @Throttle metadata. The decorator-metadata level is the source of
+// truth the PrincipalThrottlerGuard reads at runtime (it checks
+// THROTTLER:LIMIT<name> via getAllAndOverride([handler, classRef]) and exempts
+// the route when that key is absent). So "no `auth` limiter metadata on the
+// read handler/class" == "exempt from the 5/60s cap". The guard's runtime
+// behaviour is covered end-to-end in principal-throttler-guard.test.ts.
+describe('Throttle metadata — INC-005 (non-auth reads are NOT on the 5/60s `auth` bucket)', () => {
+  it('ProjectsController.list carries NO `auth` limiter metadata (handler or class)', () => {
+    expect(readNamedLimiter(ProjectsController.prototype.list, 'auth').limit).toBeUndefined();
+    expect(readNamedLimiter(ProjectsController, 'auth').limit).toBeUndefined();
+  });
+
+  it('TimeEntriesController.running carries NO `auth` limiter metadata (handler or class)', () => {
+    expect(readNamedLimiter(TimeEntriesController.prototype.running, 'auth').limit).toBeUndefined();
+    expect(readNamedLimiter(TimeEntriesController, 'auth').limit).toBeUndefined();
+  });
+
+  it('those reads also carry NO `chatbot` limiter metadata (chatbot bucket is opt-in too)', () => {
+    expect(readNamedLimiter(ProjectsController.prototype.list, 'chatbot').limit).toBeUndefined();
+    expect(readNamedLimiter(TimeEntriesController.prototype.running, 'chatbot').limit).toBeUndefined();
   });
 });

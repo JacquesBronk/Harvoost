@@ -33,6 +33,13 @@ async function bootstrap() {
     cors: {
       origin: env.CORS_ALLOWED_ORIGINS.split(',').map((s) => s.trim()),
       credentials: true,
+      // INC-005 (issue #8) Fix D — the throttler sets a Retry-After-<bucket>
+      // header on 429s (verified against @nestjs/throttler v6.5.0 source: the
+      // suffix is the blocking bucket's name, `-global`/`-auth`; `default`
+      // emits bare `Retry-After`). Browsers cannot read response headers cross
+      // origin unless they are listed here, so the web client's 429 backoff
+      // could not honour the hint. Expose all three the client may see.
+      exposedHeaders: ['Retry-After-global', 'Retry-After-auth', 'Retry-After'],
     },
   });
 
