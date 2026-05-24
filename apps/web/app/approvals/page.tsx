@@ -22,7 +22,7 @@ import { apiFetch } from '@/lib/api-client.js';
 import { useCurrentUser, isAdmin } from '@/lib/auth.js';
 import { ISO_WEEK_TOKEN_RE } from '@/lib/timesheet-periods.js';
 import { formatHours } from '@/lib/tz.js';
-import type { Paginated } from '@/lib/api-types.js';
+import type { OffsetPaginated } from '@/lib/api-types.js';
 
 interface ApprovalQueueItem {
   id: string;
@@ -43,12 +43,15 @@ export default function ApprovalsPage() {
   const queue = useQuery({
     queryKey: ['approvals', 'queue', 'manager'],
     queryFn: () =>
-      apiFetch<Paginated<ApprovalQueueItem>>('/v1/approvals/queue', {
+      apiFetch<OffsetPaginated<ApprovalQueueItem>>('/v1/approvals/queue', {
         query: { stage: 'manager', limit: 50 },
       }),
   });
 
-  const items = queue.data?.items ?? [];
+  // `GET /v1/approvals/queue` returns its (enriched ApprovalQueueItem) rows under
+  // the `{ data }` envelope, NOT `{ items }`. Reading `.items` left the queue
+  // empty live and the per-row UnlockWeekButton unreachable. Read `.data`.
+  const items = queue.data?.data ?? [];
 
   return (
     <div>

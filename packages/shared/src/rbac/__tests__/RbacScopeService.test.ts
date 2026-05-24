@@ -76,7 +76,16 @@ function makePrisma(fx: Fixture): RbacPrismaLike {
             personAnchored.set(m.project_id, m.user_id);
           }
         }
-        const allProjectIds = new Set<string>([...projectAnchored, ...personAnchored.keys()]);
+        // FEAT-002 (issue #6): self_anchored — the requester's OWN active member-projects.
+        const selfAnchored = fx.projectMembers
+          .filter((m) => m.left_at === null && m.user_id === requesterId)
+          .map((m) => m.project_id);
+        const allProjectIds = new Set<string>([
+          ...projectAnchored,
+          ...personAnchored.keys(),
+          ...selfAnchored,
+        ]);
+        // meta stays manager-anchored (self-membership is NOT counted here).
         const fromProjects = projectAnchored.length;
         const fromPersons = new Set(personAnchored.values()).size;
         return Array.from(allProjectIds).map((pid) => ({
@@ -202,6 +211,77 @@ describe('RbacScopeService — Alice/Bob/Carol/Dave worked example', () => {
     // fromProjects counts distinct anchor-projects (P1). fromPersons counts direct reports (Bob).
     expect(scope.meta.fromProjects).toBeGreaterThanOrEqual(1);
     expect(scope.meta.fromPersons).toBe(1);
+  });
+});
+
+describe('RbacScopeService — FEAT-002 employee self-visibility (issue #6)', () => {
+  let fx: Fixture;
+  let svc: RbacScopeService;
+
+  beforeEach(() => {
+    fx = baseFixture();
+    svc = new RbacScopeService({ prisma: makePrisma(fx) });
+  });
+
+  it('a plain employee (Bob) sees the projects they are a MEMBER of (P1 + P2)', async () => {
+    // Bob manages nothing; pre-FEAT-002 this returned []. Now it unions Bob's member-projects.
+    const scope = await svc.getVisibleProjectIds(BOB);
+    expect(new Set(scope.projectIds)).toEqual(new Set([P1, P2]));
+    expect(scope.unrestricted).toBe(false);
+  });
+
+  it('a plain employee (Carol) does NOT see a non-member project (P2)', async () => {
+    // Carol is a member of P1 only — P2 must stay invisible to her.
+    const scope = await svc.getVisibleProjectIds(CAROL);
+    expect(scope.projectIds).toEqual([P1]);
+    expect(scope.projectIds).not.toContain(P2);
+  });
+
+  it('a plain employee with NO memberships sees no projects (not a leak)', async () => {
+    // A lone user (the admin id, treated here as a non-admin role for this fixture) with no
+    // memberships and no management still resolves to an empty project set — no widening.
+    fx.userRoles = fx.userRoles.map((r) => (r.user_id === ADMIN ? { ...r, role: 'employee' } : r));
+    const scope = await svc.getVisibleProjectIds(ADMIN);
+    expect(scope.projectIds).toEqual([]);
+  });
+
+  it('a manager (Alice) project visibility is UNCHANGED — still her managed project only', async () => {
+    // Alice manages P1, is a member of nothing → still exactly [P1], no regression.
+    const scope = await svc.getVisibleProjectIds(ALICE);
+    expect(scope.projectIds).toEqual([P1]);
+  });
+
+  it('a manager who is ALSO a member of another project sees both (manager + self union)', async () => {
+    // Alice manages P1 AND is added as a member of P2 → both via the self-anchor union.
+    fx.projectMembers.push({ project_id: P2, user_id: ALICE, left_at: null });
+    const scope = await svc.getVisibleProjectIds(ALICE);
+    expect(new Set(scope.projectIds)).toEqual(new Set([P1, P2]));
+  });
+
+  it('a LEFT (soft-removed) membership does NOT grant project visibility', async () => {
+    // Bob left P2 (left_at set) → only P1 remains visible.
+    fx.projectMembers = fx.projectMembers.map((m) =>
+      m.project_id === P2 && m.user_id === BOB ? { ...m, left_at: '2026-01-01' } : m,
+    );
+    const scope = await svc.getVisibleProjectIds(BOB);
+    expect(scope.projectIds).toEqual([P1]);
+  });
+
+  it('employee user-visibility still includes self (own entries stay visible)', async () => {
+    // getVisibleUserIds already unions {self}; confirm Bob is in his own visible-user set.
+    const scope = await svc.getVisibleUserIds(BOB);
+    expect(scope.userIds).toContain(BOB);
+    // Bob manages no one and anchors no project, so he sees ONLY himself — no other users.
+    expect(scope.userIds).toEqual([BOB]);
+  });
+
+  it('employee project-membership does NOT leak other members of that project', async () => {
+    // Bob is a member of P1 (with Carol) and P2 (with Dave). His VISIBLE USERS must remain
+    // {Bob} only — membership grants PROJECT visibility, not other-user visibility.
+    const userScope = await svc.getVisibleUserIds(BOB);
+    expect(userScope.userIds).toEqual([BOB]);
+    expect(userScope.userIds).not.toContain(CAROL);
+    expect(userScope.userIds).not.toContain(DAVE);
   });
 });
 

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, Param, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import { RbacScopeService, ValidationFailedError } from '@harvoost/shared';
 import { CurrentUser, type CurrentUserPayload } from '../common/current-user.decorator';
@@ -128,6 +128,9 @@ export class TimesheetPeriodsController {
   // Loops the EXISTING per-entry admin-unlock logic over every locked entry in the week (same
   // audit/history writes, same reason >= 20, NO new authority), then recomputes the period → open
   // with reopened_at set. Identical audit trail to N manual per-entry admin-unlocks (DESIGN §5).
+  // FEAT-002 (issue #6): the OpenAPI pins this POST at 200 (not the NestJS @Post default 201),
+  // so @HttpCode(200) aligns the runtime status with the spec.
+  @HttpCode(200)
   @Roles('admin')
   @Post(':user_id/:iso_week/unlock')
   async unlockWeek(

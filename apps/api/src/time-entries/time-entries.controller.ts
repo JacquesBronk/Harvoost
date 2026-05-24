@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Headers,
+  HttpCode,
   Inject,
   Param,
   Patch,
@@ -97,7 +98,17 @@ export class TimeEntriesController {
     // Apply cascade visibility. We always allow self.
     const visibleUsers = await this.rbac.getVisibleUserIds(user.userId);
     const visibleProjects = await this.rbac.getVisibleProjectIds(user.userId);
-    const userIds = visibleUsers.unrestricted ? null : visibleUsers.userIds;
+    // FEAT-002 (issue #6) self-scope: ALWAYS include the caller's own user_id so a plain
+    // employee can see their OWN entries to review/submit them. The RBAC cascade already
+    // UNIONs {self}, but we harden it here via the documented withSelfScope escape hatch so a
+    // self entry is never dropped even if the cascade is empty/changes. This widens ONLY to the
+    // caller themselves — it does NOT expose any other user's entries (project-visibility, which
+    // now includes the caller's member-projects, still ANDs below). admin/finmgr short-circuit
+    // via unrestricted and are unaffected.
+    const selfScope = this.rbac.withSelfScope(user.userId);
+    const userIds = visibleUsers.unrestricted
+      ? null
+      : Array.from(new Set([...visibleUsers.userIds, ...selfScope.userIds]));
     const projectIds = visibleProjects.unrestricted ? null : visibleProjects.projectIds;
     const params: unknown[] = [];
     const wheres: string[] = [`(te.end_at IS NULL OR te.end_at IS NOT NULL)`];
@@ -306,6 +317,9 @@ export class TimeEntriesController {
   // mirroring the PATCH self-check). Flips draft→submitted, writes history rows (actor=owner),
   // skips running ('running') and already-submitted+ ('already_submitted'), and upserts the
   // timesheet_periods row. Returns { submitted_ids, skipped }.
+  // FEAT-002 (issue #6): the OpenAPI pins this POST at 200 (not the NestJS @Post default 201),
+  // so we override with @HttpCode(200) to align the runtime status with the spec.
+  @HttpCode(200)
   @Post(':id/submit')
   async submit(
     @CurrentUser() user: CurrentUserPayload,

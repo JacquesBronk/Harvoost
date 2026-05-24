@@ -28,6 +28,7 @@ function toId(row, key) {
 //   visibleProjects(M) = UNION of
 //     - project_anchored: projects where M is project_manager
 //     - person_anchored:  projects of users M directly manages
+//     - self_anchored:    projects M is a MEMBER of      (FEAT-002 expansion, issue #6)
 //
 // For Admin and FinMgr roles, the scope is unrestricted — see canActAsRole + special path.
 //
@@ -96,6 +97,11 @@ class RbacScopeService {
                 unrestricted: true,
             };
         }
+        // FEAT-002 (issue #6): self_anchored adds the caller's OWN member-projects (person-anchored
+        // to the viewer themselves) so a plain employee — who manages nothing — still sees the projects
+        // they belong to. Bounded strictly to the caller's own project_members rows (left_at IS NULL);
+        // it does not transit to other users. The from_projects/from_persons meta stay manager-anchored
+        // (unchanged) so existing meta assertions don't regress; self-membership is not counted there.
         const sql = `
       WITH project_anchored AS (
         SELECT pgm.project_id
@@ -109,14 +115,22 @@ class RbacScopeService {
         WHERE um.manager_id = $1::bigint
           AND pm.left_at IS NULL
       ),
+      self_anchored AS (
+        SELECT pm.project_id
+        FROM project_members pm
+        WHERE pm.user_id = $1::bigint
+          AND pm.left_at IS NULL
+      ),
       combined AS (
         SELECT project_id, NULL::bigint AS via_user FROM project_anchored
         UNION
         SELECT project_id, via_user FROM person_anchored
+        UNION
+        SELECT project_id, NULL::bigint AS via_user FROM self_anchored
       )
       SELECT project_id,
              (SELECT COUNT(*) FROM project_anchored) AS from_projects,
-             (SELECT COUNT(DISTINCT via_user) FROM combined WHERE via_user IS NOT NULL) AS from_persons
+             (SELECT COUNT(DISTINCT via_user) FROM person_anchored WHERE via_user IS NOT NULL) AS from_persons
       FROM combined`;
         const rows = await this.prisma.$queryRawUnsafe(sql, requesterId);
         const projectIds = Array.from(new Set(rows.map((r) => toId(r, 'project_id'))));

@@ -1,12 +1,13 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Param, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
-import { RbacForbiddenError, ValidationFailedError } from '@harvoost/shared';
+import { RbacForbiddenError, RbacScopeService, ValidationFailedError } from '@harvoost/shared';
 import { Roles } from '../common/roles.decorator';
 import { CurrentUser, type CurrentUserPayload } from '../common/current-user.decorator';
 import { ZodValidationPipe } from '../common/dto/zod-validation.pipe';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../common/audit/audit.service';
 import { PeriodService } from '../timesheet-periods/period.service';
+import { RBAC_SCOPE_SERVICE } from '../rbac/rbac.module';
 
 const ManagerActionSchema = z.object({
   entry_ids: z.array(z.string()).min(1),
@@ -20,12 +21,34 @@ const AdminUnlockSchema = z.object({
   reason: z.string().min(20),
 });
 
+// FEAT-002 (issue #6) — the approvals queue is grouped per (user, ISO-week) and RBAC-scoped.
+// `stage` drives which entry status the queue groups: manager stage groups 'submitted' entries
+// (managers/admin); final stage groups 'manager_approved' entries (finmgr/admin).
+const QueueQuery = z.object({
+  stage: z.enum(['manager', 'final']).optional(),
+  user_id: z.string().regex(/^\d+$/).optional(),
+  iso_week: z.string().regex(/^\d{4}-W\d{2}$/).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+// One row of the enriched approvals queue (the pinned FEAT-002 contract the FE consumes).
+interface ApprovalQueueItem {
+  id: string; // timesheet_periods row id if one exists, else "${user_id}-${iso_year}-${iso_week}"
+  user_id: string;
+  user_name: string; // users.display_name
+  iso_week: string; // "YYYY-Www" (ISO year + week, in the entry OWNER's timezone)
+  total_hours: number; // sum of that user's entries in the relevant status for that week
+  status: string; // 'submitted' (manager stage) or 'manager_approved' (final stage)
+  submitted_at: string; // representative (earliest) submitted timestamp for the group
+}
+
 @Controller('v1/approvals')
 export class ApprovalsController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly periods: PeriodService,
+    @Inject(RBAC_SCOPE_SERVICE) private readonly rbac: RbacScopeService,
   ) {}
 
   // FEAT-002 (issue #6): after a batch of per-entry transitions, recompute the affected periods
@@ -54,21 +77,138 @@ export class ApprovalsController {
     }
   }
 
+  // GET /v1/approvals/queue?stage=manager|final&limit=N → { data: ApprovalQueueItem[] }
+  // FEAT-002 (issue #6) — the ENRICHED, RBAC-scoped, per-(user, ISO-week) approval inbox.
+  //
+  // Grouping: entries are bucketed by (user_id, ISO-week-of-start_at-in-the-OWNER's-TZ), summing
+  // hours per group and joining users.display_name. The ISO-week uses the SAME
+  // EXTRACT(ISOYEAR/WEEK FROM (start_at AT TIME ZONE user_tz)) convention the period service +
+  // DB trigger use, so a group aligns exactly with its timesheet_periods row.
+  //
+  // Stage → status: the FE sends ?stage. stage=manager groups 'submitted' entries (manager/admin
+  // inbox); stage=final groups 'manager_approved' entries (finmgr/admin inbox). When stage is
+  // absent we FALL BACK to inferring it from the caller's roles (finmgr → final, else manager),
+  // matching the legacy behavior.
+  //
+  // RBAC: scoped to the caller's visible users via getVisibleUserIds — a manager sees only their
+  // anchored team's weeks, never the whole org. admin/finmgr are unrestricted and short-circuit
+  // the IN-filter (they see every group at the relevant stage). A caller with neither the
+  // manager nor finmgr/admin capability for the resolved stage gets an empty queue.
   @Get('queue')
-  async queue(@CurrentUser() user: CurrentUserPayload, @Query('limit') limit = '50') {
-    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+  async queue(
+    @CurrentUser() user: CurrentUserPayload,
+    @Query(new ZodValidationPipe(QueueQuery)) q: z.infer<typeof QueueQuery>,
+  ) {
+    const isAdmin = user.roles.includes('admin');
     const isFin = user.roles.includes('finmgr');
-    const isManager = user.roles.includes('manager') || user.roles.includes('admin');
-    const status = isFin ? 'manager_approved' : isManager ? 'submitted' : null;
-    if (!status) return { data: [] };
-    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT id, user_id, project_id, status, start_at, end_at
-       FROM time_entries WHERE status = $1
-       ORDER BY start_at DESC LIMIT $2::int`,
-      status,
-      lim,
-    );
-    return { data: rows };
+    const isManager = user.roles.includes('manager');
+
+    // Resolve the stage: explicit ?stage wins; else infer from roles (legacy fallback).
+    let stage: 'manager' | 'final' | null = q.stage ?? null;
+    if (stage === null) {
+      stage = isFin ? 'final' : isManager || isAdmin ? 'manager' : null;
+    }
+    if (stage === null) return { data: [] };
+
+    // Authorize the requested stage against the caller's capabilities. Manager stage requires
+    // manager OR admin; final stage requires finmgr OR admin. This prevents a manager from
+    // peeking at the finance (stage-2) queue and vice-versa.
+    if (stage === 'manager' && !(isManager || isAdmin)) return { data: [] };
+    if (stage === 'final' && !(isFin || isAdmin)) return { data: [] };
+
+    const status = stage === 'final' ? 'manager_approved' : 'submitted';
+
+    // RBAC visibility set for the caller. admin/finmgr are unrestricted (see the whole org).
+    const visible = await this.rbac.getVisibleUserIds(user.userId);
+
+    const params: unknown[] = [status];
+    const wheres: string[] = [`te.status = $1`];
+
+    // Scope to visible users unless unrestricted (admin/finmgr).
+    if (!visible.unrestricted) {
+      params.push(visible.userIds);
+      wheres.push(`te.user_id = ANY($${params.length}::bigint[])`);
+    }
+    // Optional explicit user_id narrowing (must be RBAC-visible — self always passes).
+    if (q.user_id) {
+      await this.rbac.assertCanSeeUser(user.userId, q.user_id);
+      params.push(q.user_id);
+      wheres.push(`te.user_id = $${params.length}::bigint`);
+    }
+    params.push(q.limit);
+    const limitIdx = params.length;
+
+    // Group per (user, ISO-week-in-owner-TZ). total_hours sums the entry durations (closed
+    // entries only; an entry in 'submitted'/'manager_approved' is never running, so end_at is
+    // always set). submitted_at is the earliest transition-into-`status` timestamp from
+    // time_entry_state_history (the true "submitted at"); we also LEFT JOIN timesheet_periods so
+    // the row id and its persisted submitted_at are preferred when the period row exists. iso_week
+    // is rendered "YYYY-Www" with EXTRACT in the owner's TZ — identical to the period convention.
+    const sql = `
+      WITH grouped AS (
+        SELECT
+          te.user_id,
+          EXTRACT(ISOYEAR FROM (te.start_at AT TIME ZONE u.timezone))::int AS iso_year,
+          EXTRACT(WEEK    FROM (te.start_at AT TIME ZONE u.timezone))::int AS iso_week,
+          u.display_name AS user_name,
+          SUM(EXTRACT(EPOCH FROM (te.end_at - te.start_at)) / 3600.0) AS total_hours,
+          MIN(h.first_submitted_at) AS history_submitted_at,
+          MIN(te.updated_at) AS min_updated_at
+        FROM time_entries te
+        JOIN users u ON u.id = te.user_id
+        LEFT JOIN LATERAL (
+          SELECT MIN(seh.created_at) AS first_submitted_at
+          FROM time_entry_state_history seh
+          WHERE seh.time_entry_id = te.id AND seh.to_status = $1
+        ) h ON TRUE
+        WHERE ${wheres.join(' AND ')}
+        GROUP BY te.user_id, u.display_name,
+                 EXTRACT(ISOYEAR FROM (te.start_at AT TIME ZONE u.timezone))::int,
+                 EXTRACT(WEEK    FROM (te.start_at AT TIME ZONE u.timezone))::int
+      )
+      SELECT
+        tp.id AS period_id,
+        g.user_id,
+        g.user_name,
+        g.iso_year,
+        g.iso_week,
+        g.total_hours,
+        COALESCE(tp.submitted_at, g.history_submitted_at, g.min_updated_at) AS submitted_at
+      FROM grouped g
+      LEFT JOIN timesheet_periods tp
+        ON tp.user_id = g.user_id AND tp.iso_year = g.iso_year AND tp.iso_week = g.iso_week
+      ORDER BY g.iso_year DESC, g.iso_week DESC, submitted_at DESC
+      LIMIT $${limitIdx}::int`;
+
+    type QueueRow = {
+      period_id: unknown;
+      user_id: unknown;
+      user_name: unknown;
+      iso_year: unknown;
+      iso_week: unknown;
+      total_hours: unknown;
+      submitted_at: unknown;
+    };
+    const rows = await this.prisma.$queryRawUnsafe<QueueRow[]>(sql, ...params);
+
+    const data: ApprovalQueueItem[] = rows.map((r) => {
+      const userId = String(r.user_id);
+      const isoYear = Number(r.iso_year);
+      const isoWeekNum = Number(r.iso_week);
+      const isoWeek = `${isoYear}-W${String(isoWeekNum).padStart(2, '0')}`;
+      const submittedAt = r.submitted_at instanceof Date ? r.submitted_at.toISOString() : (r.submitted_at == null ? '' : String(r.submitted_at));
+      return {
+        id: r.period_id != null ? String(r.period_id) : `${userId}-${isoYear}-${isoWeekNum}`,
+        user_id: userId,
+        user_name: r.user_name == null ? '' : String(r.user_name),
+        iso_week: isoWeek,
+        total_hours: Math.round(Number(r.total_hours ?? 0) * 100) / 100,
+        status,
+        submitted_at: submittedAt,
+      };
+    });
+
+    return { data };
   }
 
   @Roles('manager', 'admin')

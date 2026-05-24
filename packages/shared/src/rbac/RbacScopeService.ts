@@ -39,10 +39,21 @@ function toId(row: { user_id?: unknown; project_id?: unknown }, key: 'user_id' |
 //   visibleUsers(M) = UNION of
 //     - project_anchored: users on projects where M is project_manager
 //     - person_anchored:  users where M is in user_managers as manager
-//     - {M itself}
+//     - {M itself}                                       (self-scope; the viewer themselves)
 //   visibleProjects(M) = UNION of
 //     - project_anchored: projects where M is project_manager
 //     - person_anchored:  projects of users M directly manages
+//     - self_anchored:    projects M is a MEMBER of      (FEAT-002 expansion, issue #6)
+//
+// FEAT-002 (issue #6) self-visibility: a plain employee manages no projects, so the
+// manager-anchored sets above are EMPTY for them — which previously yielded an empty
+// GET /v1/projects AND (because the time-entries list ANDs project-visibility) an empty
+// GET /v1/time-entries, so they could never see their own work to submit it. The
+// self_anchored union widens visibleProjects to the caller's OWN member-projects ONLY
+// (person-anchored to the viewer themselves). This does NOT widen visibility to any other
+// user's entries or to non-member projects: it is the viewer's own membership set, nothing
+// more. visibleUsers already includes {M itself} via the UNION below, so self time-entries
+// are visible; the time-entries controller additionally hardens self into the user set.
 //
 // For Admin and FinMgr roles, the scope is unrestricted — see canActAsRole + special path.
 //
@@ -129,6 +140,11 @@ export class RbacScopeService {
       };
     }
 
+    // FEAT-002 (issue #6): self_anchored adds the caller's OWN member-projects (person-anchored
+    // to the viewer themselves) so a plain employee — who manages nothing — still sees the projects
+    // they belong to. Bounded strictly to the caller's own project_members rows (left_at IS NULL);
+    // it does not transit to other users. The from_projects/from_persons meta stay manager-anchored
+    // (unchanged) so existing meta assertions don't regress; self-membership is not counted there.
     const sql = `
       WITH project_anchored AS (
         SELECT pgm.project_id
@@ -142,14 +158,22 @@ export class RbacScopeService {
         WHERE um.manager_id = $1::bigint
           AND pm.left_at IS NULL
       ),
+      self_anchored AS (
+        SELECT pm.project_id
+        FROM project_members pm
+        WHERE pm.user_id = $1::bigint
+          AND pm.left_at IS NULL
+      ),
       combined AS (
         SELECT project_id, NULL::bigint AS via_user FROM project_anchored
         UNION
         SELECT project_id, via_user FROM person_anchored
+        UNION
+        SELECT project_id, NULL::bigint AS via_user FROM self_anchored
       )
       SELECT project_id,
              (SELECT COUNT(*) FROM project_anchored) AS from_projects,
-             (SELECT COUNT(DISTINCT via_user) FROM combined WHERE via_user IS NOT NULL) AS from_persons
+             (SELECT COUNT(DISTINCT via_user) FROM person_anchored WHERE via_user IS NOT NULL) AS from_persons
       FROM combined`;
 
     const rows = await this.prisma.$queryRawUnsafe<

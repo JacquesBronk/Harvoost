@@ -24,7 +24,7 @@ import { ErrorBlock } from '@/components/ErrorBlock.js';
 import { StartTimerControl } from '@/components/StartTimerControl.js';
 import { NewEntryForm } from '@/components/NewEntryForm.js';
 import { apiFetch, describeError } from '@/lib/api-client.js';
-import type { Paginated, SubmitWeekResponse, TimeEntry } from '@/lib/api-types.js';
+import type { OffsetPaginated, SubmitWeekResponse, TimeEntry } from '@/lib/api-types.js';
 import { formatHours, isoWeekRange, viewerTimeZone } from '@/lib/tz.js';
 import {
   canSubmitWeek,
@@ -50,7 +50,7 @@ export default function TimesheetsPage() {
   const entriesQuery = useQuery({
     queryKey: ['time-entries', 'own', week.startIso, week.endIso],
     queryFn: () =>
-      apiFetch<Paginated<TimeEntry>>('/v1/time-entries', {
+      apiFetch<OffsetPaginated<TimeEntry>>('/v1/time-entries', {
         query: {
           user_id: user?.id,
           start_at_from: week.startIso,
@@ -61,7 +61,12 @@ export default function TimesheetsPage() {
     enabled: !!user,
   });
 
-  const entries = entriesQuery.data?.items ?? [];
+  // `GET /v1/time-entries` is offset-paginated and returns its rows under the
+  // `{ data, page, page_size, total_count }` envelope (OffsetPaginated) — NOT
+  // `{ items }`. Reading `.items` here always yielded an empty list live, which
+  // left `hasDraft` false and the Submit-week button permanently disabled.
+  // Mirrors how the admin/rates list pages (INC-004) read this same envelope.
+  const entries = entriesQuery.data?.data ?? [];
 
   // FEAT-002: read the period status for the current ISO week so we can show
   // whether it's open / submitted / approved and drive the Submit-week button +

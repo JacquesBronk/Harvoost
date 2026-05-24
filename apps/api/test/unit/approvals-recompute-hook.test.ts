@@ -45,8 +45,15 @@ function makePrisma(opts: { stage1Actor?: string; counts?: Record<string, number
 function makeController(prisma: ReturnType<typeof makePrisma>) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const periods = new PeriodService(prisma as any);
+  // FEAT-002 expansion: the queue handler now needs RbacScopeService; the transition handlers
+  // exercised here don't touch it, so a minimal stub suffices.
+  const rbac = {
+    getVisibleUserIds: async () => ({ userIds: [], meta: { fromProjects: 0, fromPersons: 0 }, unrestricted: true }),
+    assertCanSeeUser: async () => undefined,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods);
+  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods, rbac);
 }
 
 describe('managerAction recompute hook', () => {

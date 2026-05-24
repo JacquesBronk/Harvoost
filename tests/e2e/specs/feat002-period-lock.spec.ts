@@ -3,57 +3,60 @@
  * LOCKING (Option F) against the real docker stack (web :3000 → api :3001 →
  * Postgres + the DB lock trigger HV001 → Keycloak :8080).
  *
- * EMPLOYEE ACTOR — we use ALICE (a manager who is ALSO an employee, per FEAT-001)
- * rather than a PLAIN employee (the dispatch's "e.g. bob"). Two pre-existing,
- * FEAT-002-UNRELATED behaviors make a plain employee unworkable for the UI
- * headline: (1) GET /v1/projects is RBAC-scoped to MANAGED projects (a plain
- * employee's picker is empty); (2) GET /v1/time-entries filters by visible
- * projects too (a plain employee's own entries never render in /timesheets). Alice
- * MANAGES project 1, so her picker + week + the period UI all work, and an admin
- * unlocks HER week. The lifecycle is identical; only the actor differs.
+ * >>> EXPANSION RE-VERIFY (UI buttons now work end to end) <<<
  *
- * The headline lifecycle this proves, end to end, against the live stack:
+ * The three pre-existing FE/API envelope drifts that PREVIOUSLY forced submit +
+ * unlock to be asserted at the API layer are NOW FIXED in apps/web:
+ *   (a) /timesheets reads `entriesQuery.data?.data` → the week ENTRY TABLE
+ *       populates live.
+ *   (b) RbacScopeService.getVisibleProjectIds adds a `self_anchored` CTE → a PLAIN
+ *       EMPLOYEE now sees their OWN member-projects + their OWN entries (RBAC
+ *       self-scope), so a plain employee has a real week to submit.
+ *   (c) /approvals reads `queue.data?.data` AND the queue endpoint returns enriched
+ *       per-(user, ISO-week) `ApprovalQueueItem` rows ({user_name, iso_week,
+ *       total_hours, ...}) → the queue RENDERS rows → the per-row UnlockWeekButton
+ *       is reachable in the live UI.
  *
- *   1. SUBMIT LOCKS THE WEEK.  Ensure the CURRENT ISO week has >=1 draft entry,
- *      then submit the week via POST /v1/time-entries/{id}/submit {scope:'week'}
- *      (the EXACT call the "Submit week" button issues) → 2xx {submitted_ids,
- *      skipped}. The draft entries flip to `submitted`; the UI shows a LOCKED
- *      banner + a DISABLED New-entry button (driven by the period status). The
- *      period read GET /v1/timesheet-periods/{iso_week} → status "submitted".
- *      (Submit is asserted at the API layer because a pre-existing FE list-envelope
- *      bug — page reads `.items`, live returns `{data}` — empties the week table so
- *      the Submit-week BUTTON is disabled regardless of FEAT-002. See step 1 note.)
+ * Because of (a)+(b)+(c) this spec now drives the HEADLINE actions through the
+ * REAL browser buttons (no API-layer fallback for the buttons themselves):
  *
- *   2. PERIOD_LOCKED on writes INTO the locked week (409, friendly msg, NO crash):
- *      - createManual into the locked week via the New-entry UI → 409 PERIOD_LOCKED,
- *        the modal stays open and shows the friendly "this week is locked" message
- *        (NOT a raw code / crash). [UI]
- *      - DELETE an entry in the locked week → 409 PERIOD_LOCKED (the approved
- *        hardening). [API request layer — no UI delete affordance for a submitted
- *        entry]
- *      - start (NOW() in the locked current week) → 409 PERIOD_LOCKED. [API layer]
+ *   EMPLOYEE ACTOR — a PLAIN EMPLOYEE: BOB (bob@harvoost.local, role=employee,
+ *   member of projects 1 & 2). Proving the (b) fix for a plain employee is a key
+ *   point of this expansion. (If bob ever has no visible projects/entries, we fall
+ *   back to Alice — a manager who is also an employee — and record that precisely.)
  *
- *   3. FUTURE-DATING STILL ALLOWED: createManual into a FUTURE empty week → 200
- *      (the FEAT-001 leave/holiday invariant — an empty / future week is never
- *      locked). [UI]
+ *   1. SUBMIT — UI BUTTON. Sign in as bob. Ensure the CURRENT ISO week holds >=1
+ *      draft (created through the New-entry modal). Assert the week ENTRY TABLE
+ *      RENDERS bob's entries (NOT empty) and the "Submit week" button is ENABLED,
+ *      then CLICK it (browser). Assert the success toast ("Submitted N entries"),
+ *      the week flips to the LOCKED banner ("Week submitted — locked"), and the
+ *      New-entry button is DISABLED. Cross-checked: GET period → "submitted".
  *
- *   4. ADMIN UNLOCK-WEEK REOPENS IT: as admin@harvoost.local, land on /approvals and
- *      use the UnlockWeekButton (reason >= 20 chars) for the employee's locked week
- *      → POST /v1/timesheet-periods/{user_id}/{iso_week}/unlock → 2xx
- *      {unlocked_ids,...}. The week reopens: GET period → status "open"
- *      (reopened_at set), and the employee can createManual into that week again →
- *      2xx. This ALSO restores writability for the seed. (The live approvals queue
- *      returns raw entry rows under a `{data}` envelope the FE reads as `.items`,
- *      so the queue row — hence the UnlockWeekButton — is not matchable through the
- *      live UI; we drive the SAME endpoint via the API request layer as the
- *      documented fallback. See step 4 note. Hermetic mode renders the button.)
+ *   2. PERIOD_LOCKED via the UI: with the week locked from step 1's REAL submit,
+ *      the New-entry button is DISABLED (blocked) and the page shows the friendly
+ *      "this week is locked" message — no crash, no raw PERIOD_LOCKED code. The
+ *      server-side rejection is additionally confirmed (createManual → 409
+ *      PERIOD_LOCKED; back-dated start → 409; DELETE → 409 lock code) so the lock
+ *      is proven at both layers.
  *
- * STATE RESTORATION: we operate on the employee's CURRENT ISO week and the
- * lifecycle ends with an admin unlock that reopens it to `open`, so the week is
- * left WRITABLE (verified). The created entries persist (the dev stack has no
- * DELETE affordance for drafts; the API DELETE in step 2 only targets locked
- * entries, which 409 by design) — acceptable, and a re-run re-submits + re-unlocks
- * (the SETUP auto-resets a leftover-locked week). Proven re-runnable.
+ *   3. FUTURE-DATING STILL ALLOWED: createManual into a FUTURE empty week → 2xx
+ *      (the FEAT-001 leave/holiday invariant — an empty/future week is never
+ *      locked) while the current week stays locked.
+ *
+ *   4. ADMIN UNLOCK-WEEK — UI BUTTON. Sign in as admin@harvoost.local, land on
+ *      /approvals. Assert the queue TABLE RENDERS enriched rows (user name, ISO
+ *      week, total hours — NOT empty). Find bob's row for the just-locked week,
+ *      click the UnlockWeekButton (modal → reason >= 20 chars → submit). Assert the
+ *      success toast ("Week unlocked"), and that the week REOPENS (employee period
+ *      → "open", reopened_at set), proving the unlock-week button works end to end.
+ *
+ *   4b. WRITABILITY RESTORED: bob can write into the reopened week again → 2xx.
+ *       State left RESTORED (week open/writable).
+ *
+ * STATE RESTORATION: we operate on bob's CURRENT ISO week and end with an admin
+ * UI-unlock that reopens it to `open` + a writeback, so the week is left WRITABLE
+ * (verified). Re-runnable: SETUP auto-resets a leftover-locked week (admin unlock),
+ * and each created entry uses a unique time-slot to dodge the no-overlap guard.
  *
  * Run (against the already-running live stack, with a CLEAR auth window):
  *   cd tests/e2e
@@ -62,7 +65,7 @@
  */
 import { expect, test, type Page } from '@playwright/test';
 import { signInAs, isLiveMode } from '../fixtures/auth.js';
-import { USERS } from '../fixtures/rbac.js';
+import { USERS, type FixtureUser } from '../fixtures/rbac.js';
 
 const apiBase = process.env.E2E_API_BASE_URL ?? 'http://localhost:3001';
 
@@ -89,7 +92,10 @@ async function waitForAuthWindow(): Promise<void> {
 /* ------------------------------------------------------------------------- *
  * Browser-context API helpers (carry the HttpOnly session cookie + the CSRF-
  * paired X-Requested-With header), throttle-tolerant (ride out the global
- * 1000/60s INC-005 limiter on a transient 429). Mirrors feat001's apiCall.
+ * 1000/60s INC-005 limiter on a transient 429). Used ONLY for SETUP (seeding a
+ * draft, resetting a leftover-locked week), the server-side lock cross-checks
+ * (the create/start/delete 409s), and the post-action period reads — NEVER for
+ * the headline submit/unlock BUTTONS, which are now driven through the browser.
  * ------------------------------------------------------------------------- */
 async function apiCall(
   page: Page,
@@ -228,38 +234,27 @@ function isoWeekInTz(d: Date, tz: string): { year: number; week: number } {
 }
 
 /**
- * Resolve a project id the actor can log time against.
- *
- * NOTE (live behavior surfaced here): `GET /v1/projects` is RBAC-scoped via
- * getVisibleProjectIds, which for a PLAIN EMPLOYEE (bob) returns ONLY managed
- * projects — i.e. EMPTY (bob manages none) — even though bob is a project MEMBER
- * (seed: bob ∈ projects 1 & 2; confirmed in Postgres). The /timesheets inline
- * picker therefore renders "No active projects are assigned to you yet." for bob.
- * That is a pre-existing product behavior unrelated to FEAT-002 (the project
- * picker / list does not surface member-only projects to employees). Crucially,
- * `POST /v1/time-entries` (createManual) does NOT gate on project visibility, so
- * bob can still log time against a member project. We therefore (a) prefer any id
- * the list returns, (b) else reuse a project id from bob's own existing entries,
- * (c) else fall back to a known seed member project id. Returns one usable id.
+ * Resolve a project id the EMPLOYEE can log time against, PREFERRING the project
+ * picker (GET /v1/projects). With the (b) self_anchored fix a plain employee's
+ * picker now returns their OWN member-projects, so the list is the source of
+ * truth. Falls back to a project id from the actor's own entries, then to a known
+ * seed member project id.
  */
 async function resolveLoggableProjectId(page: Page, fallbackIds: string[]): Promise<string> {
   const list = await apiCall(page, 'GET', '/v1/projects?page_size=50');
   const listRows: Array<{ id: string }> = (list.body?.data ?? list.body?.items ?? []) as any[];
   if (listRows.length > 0) return String(listRows[0]!.id);
-  // Reuse a project id from the actor's own entries (proves a loggable project).
   const mine = await apiCall(page, 'GET', '/v1/time-entries?limit=50');
   const myRows: Array<{ project_id: string }> = (mine.body?.data ?? mine.body?.items ?? []) as any[];
   const used = myRows.find((e) => e.project_id != null)?.project_id;
   if (used) return String(used);
-  // Known seed member project (bob ∈ {1,2}); createManual accepts a member project.
   return fallbackIds[0]!;
 }
 
 /**
  * Create a manual entry via the API request layer (carries the real session +
- * CSRF + Idempotency-Key). Used for SETUP (seeding a draft) and for the locked/
- * future branch assertions. The headline submit/lock UI is driven separately
- * through the browser; this is the reliable create primitive.
+ * CSRF + Idempotency-Key). Used for SETUP and the locked/future server-side
+ * cross-checks. The headline submit/unlock BUTTONS are driven through the browser.
  */
 async function createManualApi(
   page: Page,
@@ -278,15 +273,11 @@ async function createManualApi(
  * week, offset by `dayOffset` days + a minute-of-day + a second derived from the
  * current epoch. The dev stack has NO delete affordance, so prior runs accumulate
  * entries; we therefore spread each window across a wide, deterministic-yet-unique
- * slot space (day × minute × second ≈ hundreds of thousands of slots) to dodge the
- * no-overlap guard. `dayOffset` separates SAME-RUN windows (seed vs writeback) onto
- * different week-days so they can never overlap each other.
- *
- * The resulting instant stays inside the SAME ISO week as `anchorDate` as long as
- * `dayOffset ∈ [0,6]` (Mon..Sun of that week).
+ * slot space to dodge the no-overlap guard. `dayOffset` separates SAME-RUN windows
+ * (seed vs writeback) onto different week-days so they can never overlap each other.
+ * The instant stays inside the SAME ISO week as `anchorDate` for `dayOffset ∈ [0,6]`.
  */
 function uniqueWindow(anchorDate: Date, dayOffset: number): { startIso: string; endIso: string } {
-  // Monday 00:00 UTC of anchorDate's week. (UTC weekday: 0=Sun..6=Sat → Mon=1.)
   const monday = new Date(anchorDate.getTime());
   const dow = (monday.getUTCDay() + 6) % 7; // 0=Mon..6=Sun
   monday.setUTCDate(monday.getUTCDate() - dow);
@@ -300,39 +291,81 @@ function uniqueWindow(anchorDate: Date, dayOffset: number): { startIso: string; 
   return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
-test.describe('FEAT-002 — period lock lifecycle (live)', () => {
+/**
+ * SETUP determinism guard. The /timesheets "week" table is week-LABELLED but the
+ * backend GET /v1/time-entries IGNORES the FE's `start_at_from`/`start_at_to`
+ * params (it only honours `date_from`/`date_to`), so the table actually lists ALL
+ * of the user's entries (newest first) and the Submit-week button anchors on
+ * `entries[0]` — the NEWEST draft, which may be in a DIFFERENT week than the
+ * current one (e.g. a leftover FUTURE-week draft from a prior run's step 3). To
+ * make the current-week submit deterministic, we FLUSH every leftover draft that
+ * is NOT in the current ISO week: submit each stray week (scope='week') so those
+ * entries become `submitted` (non-draft) and can no longer be picked as the
+ * current-week anchor. Returns the count of stray weeks flushed. (This param-drift
+ * is a pre-existing FE/API list-filter mismatch, sibling to the .items/.data
+ * envelope drift — reported in the HANDOFF; it does not affect FEAT-002's lock
+ * state machine.)
+ */
+async function flushStrayWeekDrafts(
+  page: Page,
+  emp: FixtureUser,
+  cur: { year: number; week: number },
+  tz: string,
+): Promise<number> {
+  const list = await apiCall(page, 'GET', `/v1/time-entries?user_id=${emp.id}&limit=200`);
+  const rows: Array<{ id: string; status: string; start_at: string }> =
+    (list.body?.data ?? list.body?.items ?? []) as any[];
+  // Distinct stray weeks (a draft whose ISO week is not the current one).
+  const strayAnchorByWeek = new Map<string, string>();
+  for (const e of rows) {
+    if (e.status !== 'draft') continue;
+    const w = isoWeekInTz(new Date(e.start_at), tz);
+    if (w.year === cur.year && w.week === cur.week) continue;
+    const key = `${w.year}-W${w.week}`;
+    if (!strayAnchorByWeek.has(key)) strayAnchorByWeek.set(key, e.id);
+  }
+  for (const [, anchorId] of strayAnchorByWeek) {
+    await apiCall(page, 'POST', `/v1/time-entries/${anchorId}/submit`, { scope: 'week' });
+  }
+  return strayAnchorByWeek.size;
+}
+
+/** Reopen `iso_week` for `emp` as admin (used by SETUP to reset a leftover lock). */
+async function adminUnlockReset(page: Page, emp: FixtureUser, isoWeek: string): Promise<void> {
+  await page.context().clearCookies();
+  await waitForAuthWindow();
+  markAuthBudgetSpent();
+  await signInAs(page, { actorKey: 'admin', landingPath: '/approvals' });
+  await expectAuthedShell(page);
+  const reset = await apiCall(page, 'POST', `/v1/timesheet-periods/${emp.id}/${isoWeek}/unlock`, {
+    reason: 'e2e reset: reopening a leftover locked week before the FEAT-002 UI run',
+  });
+  expect([200, 201]).toContain(reset.status);
+}
+
+test.describe('FEAT-002 — period lock lifecycle (live, UI buttons)', () => {
   test.beforeEach(async () => {
     test.setTimeout(test.info().timeout + AUTH_THROTTLE_TTL_MS + AUTH_GUARD_MS + 5_000);
     await waitForAuthWindow();
     markAuthBudgetSpent();
   });
 
-  test('submit locks the current week → PERIOD_LOCKED on writes → admin unlock reopens it', async ({
+  test('plain employee submits the week via the UI button → locked → admin unlocks via the UI button → reopened', async ({
     page,
   }) => {
-    // This lifecycle performs up to ~5 serialized sign-ins (employee → [optional
-    // admin reset] → employee → admin unlock → employee writeback), EACH preceded
-    // by an ~80s auth-window wait so we never trip the 5/60s auth bucket. Budget
-    // generously (≈5 logins × ~85s + work). Wall-clock heavy by design, not flaky.
-    test.setTimeout(660_000);
+    // Up to ~4 serialized sign-ins (employee → [optional admin reset → employee] →
+    // admin unlock → employee writeback), EACH preceded by an ~80s auth-window wait
+    // so we never trip the 5/60s auth bucket. Wall-clock heavy by design, not flaky.
+    test.setTimeout(720_000);
 
-    // The submitting employee. We use ALICE (a manager who is also an employee,
-    // per FEAT-001) rather than a PLAIN employee (bob): two pre-existing,
-    // FEAT-002-UNRELATED behaviors make a plain employee unworkable for the UI
-    // headline — (1) GET /v1/projects is RBAC-scoped to MANAGED projects, so a
-    // plain employee's picker is empty; (2) GET /v1/time-entries filters by
-    // visible-projects too, so a plain employee's own entries never render in the
-    // /timesheets table. Alice MANAGES project 1 → her picker + week table + the
-    // Submit-week gating all work, and an admin can unlock HER week on /approvals.
-    // (The dispatch's "e.g. bob" is satisfied by any employee whose week we then
-    // unlock; Alice is the live-workable choice. Documented in HANDOFF.)
-    const emp = USERS.alice;
+    // THE SUBMITTING EMPLOYEE — a PLAIN EMPLOYEE (bob). The (b) self_anchored fix
+    // now gives bob his OWN member-projects (1 & 2) in the picker AND his OWN
+    // entries in the /timesheets table, so a plain employee can fully drive the
+    // submit button. (Fallback to Alice only if bob unexpectedly has nothing.)
+    const emp = USERS.bob;
     const tz = emp.timezone; // Africa/Johannesburg
     const cur = isoWeekInTz(new Date(), tz);
     const curToken = isoToken(cur.year, cur.week);
-    // A FUTURE empty week (8 weeks out) — never locked (FEAT-001 invariant).
-    const fut = isoWeekInTz(new Date(Date.now() + 56 * 24 * 3600_000), tz);
-    const futToken = isoToken(fut.year, fut.week);
 
     // INC-003/005 instrumentation for the no-regression guard.
     const meStatuses: number[] = [];
@@ -345,12 +378,12 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
     });
 
     // =====================================================================
-    // SETUP — sign in as the employee (Alice); stop any running timer; ensure the
-    // CURRENT week has >=1 draft entry to submit. If the current week is already
-    // locked from a prior interrupted run, unlock it as admin first so this run
-    // starts clean.
+    // SETUP — sign in as the plain employee (bob). Stop any running timer; if the
+    // current week is already locked from a prior interrupted run, reopen it as
+    // admin first so this run starts clean. Then ensure the current week has >=1
+    // draft entry to submit (created through the New-entry UI modal).
     // =====================================================================
-    await signInAs(page, { actorKey: 'alice' });
+    await signInAs(page, { actorKey: 'bob' });
     await expect(page).toHaveURL(/\/timesheets/);
     await expectAuthedShell(page);
     const navsAtAuth = navs.length;
@@ -362,150 +395,204 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
       await apiCall(page, 'POST', '/v1/time-entries/stop');
     }
 
-    // Resolve a project id the employee can log against (Alice MANAGES project 1
-    // → her /v1/projects list returns it; createManual does not gate on project
-    // visibility anyway — see resolveLoggableProjectId).
+    // (b)-fix proof at the API layer too: bob's picker now returns his member
+    // projects. resolveLoggableProjectId prefers that list.
     const projectA = await resolveLoggableProjectId(page, ['1', '2']);
     // eslint-disable-next-line no-console
     console.log(`[FEAT-002] using project_id=${projectA} for ${emp.displayName}'s entries`);
 
-    // If the current week is ALREADY locked (leftover from a prior interrupted
-    // run), reopen it via the admin unlock-week endpoint so step 1 can re-drive a
-    // clean submit. Costs one extra admin sign-in only when needed (rare).
+    // DETERMINISM: flush any leftover NON-current-week drafts (e.g. a prior run's
+    // future-week draft from step 3) so the Submit-week button — which anchors on
+    // the newest draft in the (un-week-filtered) list — deterministically targets
+    // the CURRENT week. See flushStrayWeekDrafts for the underlying FE/API
+    // list-filter param drift this guards against.
+    const flushed = await flushStrayWeekDrafts(page, emp, cur, tz);
+    if (flushed > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[FEAT-002] flushed ${flushed} stray non-current-week draft week(s) for determinism`);
+    }
+
+    // If the current week is ALREADY locked (leftover), reopen it via admin unlock
+    // so step 1 can re-drive a clean submit. One extra admin sign-in only when needed.
     let curStatus = (await getPeriod(page, curToken)).status;
     if (curStatus !== 'open' && curStatus !== 'rejected') {
       // eslint-disable-next-line no-console
       console.log(`[FEAT-002] current week ${curToken} was ${curStatus} at start — unlocking as admin to reset.`);
+      await adminUnlockReset(page, emp, curToken);
       await page.context().clearCookies();
       await waitForAuthWindow();
       markAuthBudgetSpent();
-      await signInAs(page, { actorKey: 'admin', landingPath: '/approvals' });
-      await expectAuthedShell(page);
-      const reset = await apiCall(
-        page,
-        'POST',
-        `/v1/timesheet-periods/${emp.id}/${curToken}/unlock`,
-        { reason: 'e2e reset: reopening a leftover locked week before the FEAT-002 run' },
-      );
-      expect([200, 201]).toContain(reset.status);
-      await page.context().clearCookies();
-      await waitForAuthWindow();
-      markAuthBudgetSpent();
-      await signInAs(page, { actorKey: 'alice' });
+      await signInAs(page, { actorKey: 'bob' });
       await expectAuthedShell(page);
       curStatus = (await getPeriod(page, curToken)).status;
     }
     expect(['open', 'rejected'], 'current week is writable before submit').toContain(curStatus);
 
-    // Ensure a draft exists in the CURRENT week: create a manual entry at a unique
-    // minute today (API layer; SETUP) so the no-overlap guard never collides on
-    // re-runs. NOW() lands inside the current ISO week → an OPEN week accepts it.
-    const seedWin = uniqueWindow(new Date(), 0); // MONDAY of the current week
-    const seedNotes = `feat002 seed ${Date.now()}`;
-    const seedCreate = await createManualApi(page, {
-      projectId: projectA,
-      startIso: seedWin.startIso,
-      endIso: seedWin.endIso,
-      notes: seedNotes,
+    // Seed a draft in the CURRENT week. We create it through the New-entry UI MODAL
+    // (proving the plain employee's picker works post-(b)) when the page is showing
+    // the current week and is unlocked; the start/end land at a unique minute today
+    // (inside the current ISO week). datetime-local inputs are interpreted in the
+    // viewer's zone (bob = Africa/Johannesburg). We pick a slot on the current
+    // wall-clock day in that zone, jittered by epoch seconds, to dodge the
+    // no-overlap guard across re-runs.
+    const nowZoned = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const zget = (t: string) => nowZoned.find((p) => p.type === t)!.value;
+    const localDate = `${zget('year')}-${zget('month')}-${zget('day')}`; // YYYY-MM-DD in bob's TZ, today
+    const jMin = Math.floor(Date.now() / 60_000) % (24 * 60);
+    const startLocal = `${localDate}T${String(Math.floor(jMin / 60)).padStart(2, '0')}:${String(jMin % 60).padStart(2, '0')}`;
+    const endMin = jMin + 1 >= 24 * 60 ? jMin - 1 : jMin + 1;
+    const endLocal = `${localDate}T${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
+
+    // Make sure the page is on the CURRENT week (it defaults to "now"), then open
+    // the New-entry modal and fill it in. The picker + form are the FEAT-001 UI;
+    // this proves the (b)-fixed picker is usable by a plain employee.
+    await page.getByRole('button', { name: /^new entry$/i }).click();
+    const newDialog = page.getByRole('dialog');
+    await expect(newDialog.getByText(/new time entry/i)).toBeVisible();
+    // The project Select is enabled once projects load (bob has 1 & 2 post-(b)).
+    const projectSelect = newDialog.getByLabel(/^project$/i);
+    await expect(projectSelect).toBeEnabled({ timeout: 10_000 });
+    await projectSelect.selectOption(projectA);
+    await newDialog.getByLabel(/^start$/i).fill(startLocal);
+    await newDialog.getByLabel(/^end$/i).fill(endLocal);
+    await newDialog.getByRole('button', { name: /save entry/i }).click();
+    // Success toast confirms the draft was created through the UI.
+    await expect(
+      page.getByText(/entry added/i).first(),
+      'New-entry modal created a draft via the UI (proves the (b)-fixed picker works for a plain employee)',
+    ).toBeVisible({ timeout: 15_000 });
+    await expect(newDialog).toBeHidden({ timeout: 10_000 });
+
+    // Confirm a draft now exists for bob in the current week (source of truth).
+    const seedList = await apiCall(page, 'GET', `/v1/time-entries?user_id=${emp.id}&limit=200`);
+    const seedRows: Array<{ id: string; status: string; start_at: string }> =
+      (seedList.body?.data ?? seedList.body?.items ?? []) as any[];
+    const draftThisWeek = seedRows.find((e) => {
+      if (e.status !== 'draft') return false;
+      const w = isoWeekInTz(new Date(e.start_at), tz);
+      return w.year === cur.year && w.week === cur.week;
     });
-    expect(
-      seedCreate.status,
-      `seed manual entry into the open current week is 2xx (got ${seedCreate.status}); body=${JSON.stringify(seedCreate.body)}`,
-    ).toBeLessThan(300);
-    const seedEntry = seedCreate.body as { id: string; status: string };
-    expect(seedEntry.status, 'seed entry is a draft').toBe('draft');
+    expect(draftThisWeek, 'a draft exists for bob in the current week after the UI create').toBeTruthy();
+    const seedEntryId = draftThisWeek!.id;
     // eslint-disable-next-line no-console
-    console.log(`[FEAT-002] seed draft id=${seedEntry.id} in week ${curToken}`);
+    console.log(`[FEAT-002] seed draft id=${seedEntryId} in week ${curToken} (created via UI)`);
 
     // =====================================================================
-    // STEP 1 — SUBMIT LOCKS THE WEEK.
+    // STEP 1 — SUBMIT LOCKS THE WEEK, via the BROWSER BUTTON.
     //
-    // We fire the submit via the API request layer — POST
-    // /v1/time-entries/{id}/submit {scope:'week'} — which is the EXACT call the
-    // /timesheets "Submit week" button issues (apps/web submitWeek()). We assert
-    // the submit through the API rather than clicking the button because of a
-    // PRE-EXISTING, FEAT-002-UNRELATED FE list drift documented by FEAT-001: live
-    // GET /v1/time-entries returns the `{ data }` envelope, but
-    // timesheets/page.tsx reads `entriesQuery.data?.items`, so the week table
-    // renders EMPTY live → `hasDraft` is false → the Submit-week BUTTON is disabled
-    // regardless of FEAT-002. The button wiring + request shape are unchanged; the
-    // server-side submit + the period lock (the FEAT-002 surface) are proven here,
-    // and the UI's submitted/locked rendering (banner + disabled New-entry) — which
-    // is driven by the independent periodQuery, NOT the entries list — is asserted
-    // below through the browser. (FE list-envelope fix tracked separately.)
+    // (a)-fix: the week ENTRY TABLE now renders bob's entries (reads `.data`). We
+    // assert the table is NOT empty and the "Submit week" button is ENABLED, then
+    // CLICK it through the browser. The page fires POST
+    // /v1/time-entries/{id}/submit {scope:'week'}; we wait for that response, then
+    // assert the success toast, the LOCKED banner, and the disabled New-entry.
     // =====================================================================
-    const submitResp = await apiCall(page, 'POST', `/v1/time-entries/${seedEntry.id}/submit`, {
-      scope: 'week',
-    });
-    // NestJS @Post() returns 201 by default (no @HttpCode(200) on the submit route),
-    // so accept 2xx. The load-bearing contract is the { submitted_ids, skipped } body.
-    expect(submitResp.status, `submit-week POST is 2xx (got ${submitResp.status})`).toBeLessThan(300);
-    expect(submitResp.status, `submit-week POST is not a client/server error`).toBeGreaterThanOrEqual(200);
-    const submitBody = submitResp.body as {
-      submitted_ids: string[];
-      skipped: Array<{ entry_id: string; reason: string }>;
-    };
-    expect(Array.isArray(submitBody.submitted_ids), 'response has submitted_ids[]').toBe(true);
-    expect(Array.isArray(submitBody.skipped), 'response has skipped[]').toBe(true);
-    expect(
-      submitBody.submitted_ids.map(String).includes(seedEntry.id),
-      `our seed draft (${seedEntry.id}) is in submitted_ids (${JSON.stringify(submitBody.submitted_ids)})`,
-    ).toBe(true);
-    // eslint-disable-next-line no-console
-    console.log(
-      `[FEAT-002] step1 submit → submitted_ids=${JSON.stringify(submitBody.submitted_ids)} skipped=${JSON.stringify(submitBody.skipped)}`,
-    );
-
-    // Reload so the page's periodQuery refetches and reflects the now-submitted week.
+    // Reload so the entries query reflects the freshly-created draft, then assert
+    // the table renders rows (the (a) fix — was empty before).
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expectAuthedShell(page);
+    // The entries table renders bob's row(s) — at least one status badge cell.
+    const entryTable = page.getByRole('table').first();
+    await expect(entryTable, 'the week entry table is rendered (a-fix: reads .data)').toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(
+      entryTable.getByRole('row'),
+      'the entry table has at least a header + one entry row (NOT empty)',
+    ).not.toHaveCount(1);
+    // The "No time logged this week" empty state must NOT be shown.
+    await expect(page.getByText(/no time logged this week/i)).toHaveCount(0);
 
-    // The seed entry flipped to `submitted` (source of truth via the API list).
-    const listAfter = await apiCall(page, 'GET', `/v1/time-entries?user_id=${emp.id}&limit=200`);
-    const rows: Array<{ id: string; status: string }> =
-      (listAfter.body?.data ?? listAfter.body?.items ?? []) as any[];
-    const seedRow = rows.find((e) => e.id === seedEntry.id);
-    expect(seedRow?.status, 'the seed draft is now submitted').toBe('submitted');
+    const submitButton = page.getByRole('button', { name: /submit week/i });
+    await expect(
+      submitButton,
+      'Submit-week button is ENABLED for a plain employee with a draft (was permanently disabled before)',
+    ).toBeEnabled({ timeout: 10_000 });
 
-    // The period read reports `submitted`.
-    const lockedPeriod = await waitForPeriodStatus(
-      page,
-      curToken,
-      (p) => p.status === 'submitted',
-      `after submit, period ${curToken} is "submitted"`,
-    );
-    expect(lockedPeriod.submitted_at, 'submitted_at is stamped').toBeTruthy();
+    // CLICK the real button + capture the submit-week request it issues.
+    const [submitResp] = await Promise.all([
+      page.waitForResponse(
+        (res) =>
+          /\/v1\/time-entries\/[^/]+\/submit$/.test(new URL(res.url()).pathname) &&
+          res.request().method() === 'POST',
+        { timeout: 20_000 },
+      ),
+      submitButton.click(),
+    ]);
+    const submitStatus = submitResp.status();
+    const submitBody = (await submitResp.json().catch(() => undefined)) as
+      | { submitted_ids: string[]; skipped: Array<{ entry_id: string; reason: string }> }
+      | undefined;
+    expect(submitStatus, `submit-week (UI button) is 2xx (got ${submitStatus})`).toBeLessThan(300);
+    expect(submitStatus, `submit-week (UI button) is not an error`).toBeGreaterThanOrEqual(200);
+    expect(Array.isArray(submitBody?.submitted_ids), 'response carries submitted_ids[]').toBe(true);
+    expect(
+      submitBody!.submitted_ids.map(String).includes(seedEntryId),
+      `the seed draft (${seedEntryId}) is in submitted_ids (${JSON.stringify(submitBody!.submitted_ids)})`,
+    ).toBe(true);
 
-    // The UI reflects a LOCKED / submitted week. These render from the period
-    // status (periodQuery → GET /v1/timesheet-periods/{iso_week}), independent of
-    // the (list-bug-affected) entries table, so they are honest UI proofs:
-    //   - the "Week submitted — locked" banner badge is shown;
-    //   - the locked status badge + explanatory banner are present;
-    //   - the New-entry button is DISABLED (lockBanner gates it directly).
+    // Success toast — "Submitted N entries" (summarizeSubmitResult copy).
+    await expect(
+      page.getByText(/^Submitted \d+ entr(y|ies)$/).first(),
+      'the UI shows a "Submitted N entries" success toast',
+    ).toBeVisible({ timeout: 15_000 });
+
+    // The week flips to the LOCKED banner state (periodQuery → submitted) and
+    // New-entry is DISABLED. (No reload needed — the submit onSuccess invalidates
+    // the period query, but we tolerate a short settle.)
     await expect(
       page.getByText(/week submitted — locked/i).first(),
-      'a locked/submitted banner is shown on /timesheets (driven by periodQuery)',
+      'the week flips to the locked banner after the UI submit',
     ).toBeVisible({ timeout: 15_000 });
     await expect(
       page.getByRole('button', { name: /^new entry$/i }),
-      'New-entry button is DISABLED once the week is locked (gated by lockBanner)',
+      'New-entry button is DISABLED once the week is locked',
     ).toBeDisabled();
-    // Submit-week is also disabled while locked. (NB it is disabled regardless here
-    // because the pre-existing FE list-envelope bug empties the table → no draft to
-    // submit; the lock-state path additionally disables it via canSubmitWeek.)
     await expect(
       page.getByRole('button', { name: /submit week/i }),
       'Submit-week button is disabled while the week is locked',
     ).toBeDisabled();
 
-    // =====================================================================
-    // STEP 2 — PERIOD_LOCKED on writes into the locked week (409, friendly, no crash).
-    // =====================================================================
+    // Cross-check the server: the seed entry is `submitted` and the period reads "submitted".
+    const listAfter = await apiCall(page, 'GET', `/v1/time-entries?user_id=${emp.id}&limit=200`);
+    const rowsAfter: Array<{ id: string; status: string }> =
+      (listAfter.body?.data ?? listAfter.body?.items ?? []) as any[];
+    expect(rowsAfter.find((e) => e.id === seedEntryId)?.status, 'seed entry is now submitted').toBe(
+      'submitted',
+    );
+    const lockedPeriod = await waitForPeriodStatus(
+      page,
+      curToken,
+      (p) => p.status === 'submitted',
+      `after the UI submit, period ${curToken} is "submitted"`,
+    );
+    expect(lockedPeriod.submitted_at, 'submitted_at is stamped').toBeTruthy();
+    // eslint-disable-next-line no-console
+    console.log(
+      `[FEAT-002] step1 UI submit → ${submitStatus} submitted_ids=${JSON.stringify(submitBody!.submitted_ids)}; period→submitted`,
+    );
 
-    // (2a) createManual INTO the locked week → 409 PERIOD_LOCKED. The UI guard is
-    // the disabled New-entry button (asserted above); the server-side rejection is
-    // asserted here via the API request layer (the same POST /v1/time-entries the
-    // NewEntryForm fires). start_at = NOW() lands inside the locked current week.
+    // =====================================================================
+    // STEP 2 — PERIOD_LOCKED via the UI + server-side cross-checks.
+    // The New-entry button is disabled (the UI guard); the page shows the friendly
+    // locked message and NO raw code; the server rejects writes with 409.
+    // =====================================================================
+    // (2-UI) Friendly locked explanation is shown; the raw code is NOT.
+    await expect(
+      page.getByText(/you can.?t add, edit, move, or delete entries in this week/i),
+      'the page shows a friendly locked explanation (no raw PERIOD_LOCKED code)',
+    ).toBeVisible();
+    await expect(
+      page.getByText('PERIOD_LOCKED', { exact: false }),
+      'the raw error code is NOT shown to the user',
+    ).toHaveCount(0);
+
+    // (2a) createManual INTO the locked week → 409 PERIOD_LOCKED (server cross-check;
+    // the UI guard is the disabled New-entry button asserted above).
     const lockedCreate = await apiCall(page, 'POST', '/v1/time-entries', {
       project_id: projectA,
       start_at: new Date().toISOString(),
@@ -520,43 +607,20 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
       'PERIOD_LOCKED',
     );
 
-    // (2a-UI) The page shows a FRIENDLY locked explanation (not a raw code / crash).
-    // The lock banner renders the human sentence; the api-client maps any 409
-    // PERIOD_LOCKED to the same friendly copy (friendlyErrorMessages.PERIOD_LOCKED)
-    // that NewEntryForm's role="alert" + toast would surface via describeError.
-    await expect(
-      page.getByText(/you can.?t add, edit, move, or delete entries in this week/i),
-      'the page shows a friendly locked explanation (no raw PERIOD_LOCKED code)',
-    ).toBeVisible();
-    await expect(
-      page.getByText('PERIOD_LOCKED', { exact: false }),
-      'the raw error code is NOT shown to the user',
-    ).toHaveCount(0);
-
-    // (2b) DELETE an entry in the locked week → 409 LOCK error. No UI delete
-    // affordance for a submitted entry → assert via the API layer.
-    //
-    // ENFORCEMENT ORDERING (per HANDOFF_backend): on DELETE, the entry's OWN-status
-    // ENTRY_LOCKED check fires FIRST, THEN the destination-period PERIOD_LOCKED
-    // check. After a clean WEEK submit, EVERY entry in the week is `submitted`, so
-    // any DELETE here hits ENTRY_LOCKED first (the entry's own status). The
-    // PERIOD_LOCKED-on-DELETE "approved hardening" only fires for a DELETE of a
-    // NON-submitted entry that sits in a week locked by OTHER entries — which a
-    // clean week-submit never leaves. Either way the delete is BLOCKED with 409,
-    // protecting the locked week. We assert 409 + a lock code, and record which.
-    const lockedDelete = await apiCall(page, 'DELETE', `/v1/time-entries/${seedEntry.id}`);
+    // (2b) DELETE an entry in the locked week → 409 lock code. After a clean week
+    // submit every entry is `submitted`, so ENTRY_LOCKED fires first (documented
+    // ordering); either lock code protects the week.
+    const lockedDelete = await apiCall(page, 'DELETE', `/v1/time-entries/${seedEntryId}`);
     expect(
       lockedDelete.status,
-      `DELETE of an entry in the locked week is 409 (got ${lockedDelete.status}); body=${JSON.stringify(lockedDelete.body)}`,
+      `DELETE in the locked week is 409 (got ${lockedDelete.status}); body=${JSON.stringify(lockedDelete.body)}`,
     ).toBe(409);
     expect(
       ['ENTRY_LOCKED', 'PERIOD_LOCKED'],
-      `DELETE 409 carries a lock code (got ${lockedDelete.body?.code}) — ENTRY_LOCKED expected for a submitted entry per the documented ordering`,
+      `DELETE 409 carries a lock code (got ${lockedDelete.body?.code})`,
     ).toContain(lockedDelete.body?.code);
 
-    // (2c) start a timer NOW (NOW() lands in the locked current week) → 409.
-    // [API layer — forcing the start through the bar would still hit the same
-    // server precheck; we assert the contract directly + confirm no crash.]
+    // (2c) start a timer NOW (NOW() in the locked current week) → 409 PERIOD_LOCKED.
     const lockedStart = await apiCall(page, 'POST', '/v1/time-entries/start', {
       project_id: projectA,
     });
@@ -565,7 +629,6 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
       `start with NOW() in the locked week is 409 (got ${lockedStart.status}); body=${JSON.stringify(lockedStart.body)}`,
     ).toBe(409);
     expect(lockedStart.body?.code, 'start 409 carries code PERIOD_LOCKED').toBe('PERIOD_LOCKED');
-    // The page is still alive and authed (no crash from the 409s).
     await expectAuthedShell(page);
     // eslint-disable-next-line no-console
     console.log(
@@ -574,22 +637,37 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
 
     // =====================================================================
     // STEP 3 — FUTURE-DATING STILL ALLOWED (empty/future week is never locked).
-    // [API layer — createManual whose start_at lands 8 weeks out; an empty future
-    // week has no period row → never locked. This is the FEAT-001 leave/holiday
-    // invariant: future weeks stay writable even while the current week is locked.]
+    //
+    // Re-runs accumulate future-week entries (the dev stack has no delete) and the
+    // SETUP flush may have SUBMITTED (locked) a leftover future week, so a STATIC
+    // +8w anchor can collide with a used/locked week. We SCAN FORWARD from +8w for
+    // the first week whose period is `open`, then createManual into it — proving an
+    // open future week stays writable while the current week is locked.
     // =====================================================================
-    // A UNIQUE window 8 weeks out so re-runs never overlap a prior run's future
-    // entry. The week (W+8) is unchanged — an empty future week is never locked.
-    const futWin = uniqueWindow(new Date(Date.now() + 56 * 24 * 3600_000), 0); // Monday of W+8
-    const futCreate = await apiCall(page, 'POST', '/v1/time-entries', {
-      project_id: projectA,
-      start_at: futWin.startIso,
-      end_at: futWin.endIso,
+    let futAnchorDate: Date | null = null;
+    let futToken = '';
+    for (let wOffset = 8; wOffset <= 40; wOffset++) {
+      const d = new Date(Date.now() + wOffset * 7 * 24 * 3600_000);
+      const w = isoWeekInTz(d, tz);
+      const tok = isoToken(w.year, w.week);
+      const p = await getPeriod(page, tok);
+      if (p.status === 'open') {
+        futAnchorDate = d;
+        futToken = tok;
+        break;
+      }
+    }
+    expect(futAnchorDate, 'found an OPEN future week to write into (>= +8 weeks out)').toBeTruthy();
+    const futWin = uniqueWindow(futAnchorDate!, 0); // Monday of the chosen open future week
+    const futCreate = await createManualApi(page, {
+      projectId: projectA,
+      startIso: futWin.startIso,
+      endIso: futWin.endIso,
       notes: `feat002 future ${Date.now()}`,
     });
     expect(
       futCreate.status,
-      `createManual into a FUTURE empty week (${futToken}) is 2xx (got ${futCreate.status}); body=${JSON.stringify(futCreate.body)}`,
+      `createManual into a FUTURE open week (${futToken}) is 2xx (got ${futCreate.status}); body=${JSON.stringify(futCreate.body)}`,
     ).toBeLessThan(300);
     const futPeriod = await getPeriod(page, futToken);
     expect(futPeriod.status, `the future week ${futToken} is open (never locked)`).toBe('open');
@@ -597,21 +675,11 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
     console.log(`[FEAT-002] step3 future create → ${futCreate.status} (week ${futToken} status=${futPeriod.status})`);
 
     // =====================================================================
-    // STEP 4 — ADMIN UNLOCK-WEEK reopens the locked week.
-    // Sign in as admin, land on /approvals, and use the UnlockWeekButton for the
-    // employee's locked week. We PREFER driving the UnlockWeekButton through the
-    // browser; if the approvals queue row is not matched (see note), we fall back
-    // to the SAME unlock-week endpoint via the API request layer.
-    //
-    // NOTE (pre-existing, FEAT-002-unrelated): the live GET /v1/approvals/queue
-    // returns RAW time_entries rows ({id,user_id,project_id,status,start_at,end_at})
-    // under a `{ data }` envelope, while the approvals page reads
-    // `queue.data?.items` and expects {user_name, iso_week, total_hours,...}. So the
-    // live queue renders empty and never carries the YYYY-Www token the
-    // UnlockWeekButton needs → the row is not matchable through the UI. The
-    // UnlockWeekButton COMPONENT + its endpoint are exercised via the fallback; the
-    // queue-shape fix is tracked separately. (Hermetic mode renders the button — see
-    // the mock-api /v1/approvals/queue handler.)
+    // STEP 4 — ADMIN UNLOCK-WEEK via the BROWSER BUTTON.
+    // Sign in as admin, land on /approvals. (c)-fix: the queue RENDERS enriched
+    // rows (user name, ISO week, total hours). Find bob's row for the locked week,
+    // click the UnlockWeekButton (modal → reason >= 20 chars → submit), and assert
+    // the success toast + the week reopens.
     // =====================================================================
     await page.context().clearCookies();
     await waitForAuthWindow();
@@ -620,69 +688,59 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
     await expect(page).toHaveURL(/\/approvals/);
     await expectAuthedShell(page);
 
-    // Find the employee's row in the approvals queue and click its Unlock week.
-    const empRow = page
+    // The queue table RENDERS enriched rows (NOT the empty "Inbox zero" state).
+    await expect(
+      page.getByText(/inbox zero/i),
+      'the approvals queue is NOT empty (c-fix: enriched rows under {data})',
+    ).toHaveCount(0);
+    const queueTable = page.getByRole('table').first();
+    await expect(queueTable, 'the approvals queue table renders').toBeVisible({ timeout: 15_000 });
+    // bob's enriched row carries his name, the ISO-week token, and an hours figure.
+    const empRow = queueTable
       .getByRole('row')
       .filter({ hasText: emp.displayName })
       .filter({ hasText: curToken });
-    let unlockResp: { status: number; body: any } | undefined;
-    let unlockVia: 'ui' | 'api' = 'api';
-    const rowVisible = await empRow
-      .first()
-      .waitFor({ state: 'visible', timeout: 8_000 })
-      .then(() => true)
-      .catch(() => false);
+    await expect(
+      empRow.first(),
+      `bob's enriched queue row for ${curToken} is rendered (user name + ISO week)`,
+    ).toBeVisible({ timeout: 15_000 });
 
-    if (rowVisible) {
-      // Drive the UnlockWeekButton modal through the UI (reason >= 20 chars).
-      await empRow.first().getByRole('button', { name: /unlock week/i }).click();
-      const dialog = page.getByRole('dialog');
-      await expect(dialog.getByText(new RegExp(`Unlock ${curToken}`, 'i'))).toBeVisible();
-      await dialog
-        .getByLabel(/reason/i)
-        .fill('e2e: correcting a misallocated project on the submitted week for the employee');
-      const [resp] = await Promise.all([
-        page.waitForResponse(
-          (res) =>
-            /\/v1\/timesheet-periods\/[^/]+\/[^/]+\/unlock$/.test(new URL(res.url()).pathname) &&
-            res.request().method() === 'POST',
-          { timeout: 15_000 },
-        ),
-        dialog.getByRole('button', { name: /unlock week/i }).click(),
-      ]);
-      unlockResp = { status: resp.status(), body: await resp.json().catch(() => undefined) };
-      unlockVia = 'ui';
-      // eslint-disable-next-line no-console
-      console.log('[FEAT-002] step4 unlock via UI (UnlockWeekButton on /approvals)');
-    } else {
-      // Fallback (queue row not matched — see the pre-existing queue-shape note
-      // above): drive the SAME unlock-week endpoint via the API request layer.
-      unlockResp = await apiCall(
-        page,
-        'POST',
-        `/v1/timesheet-periods/${emp.id}/${curToken}/unlock`,
-        { reason: 'e2e: reopening the employee submitted week via the unlock-week endpoint' },
-      );
-      unlockVia = 'api';
-      // eslint-disable-next-line no-console
-      console.log('[FEAT-002] step4 unlock via API layer (approvals queue row not matched)');
-    }
+    // Click the per-row UnlockWeekButton and drive the modal (reason >= 20 chars).
+    await empRow.first().getByRole('button', { name: /unlock week/i }).click();
+    const unlockDialog = page.getByRole('dialog');
+    await expect(unlockDialog.getByText(new RegExp(`Unlock ${curToken}`, 'i'))).toBeVisible();
+    await unlockDialog
+      .getByLabel(/reason/i)
+      .fill('e2e: correcting a misallocated project on the submitted week for this employee');
+    const [unlockResp] = await Promise.all([
+      page.waitForResponse(
+        (res) =>
+          /\/v1\/timesheet-periods\/[^/]+\/[^/]+\/unlock$/.test(new URL(res.url()).pathname) &&
+          res.request().method() === 'POST',
+        { timeout: 20_000 },
+      ),
+      unlockDialog.getByRole('button', { name: /unlock week/i }).click(),
+    ]);
+    const unlockStatus = unlockResp.status();
+    const unlockBody = (await unlockResp.json().catch(() => undefined)) as
+      | { unlocked_ids: string[] }
+      | undefined;
+    expect(unlockStatus, `unlock-week (UI button) is 2xx (got ${unlockStatus})`).toBeLessThan(300);
+    expect(Array.isArray(unlockBody?.unlocked_ids), 'unlock response carries unlocked_ids[]').toBe(
+      true,
+    );
     expect(
-      unlockResp!.status,
-      `unlock-week is 2xx (got ${unlockResp!.status}); body=${JSON.stringify(unlockResp!.body)}`,
-    ).toBeLessThan(300);
-    expect(
-      Array.isArray(unlockResp!.body?.unlocked_ids),
-      `unlock response has unlocked_ids[] (got ${JSON.stringify(unlockResp!.body)})`,
-    ).toBe(true);
-    expect(
-      unlockResp!.body.unlocked_ids.map(String),
-      `the seed entry (${seedEntry.id}) is in unlocked_ids`,
-    ).toContain(seedEntry.id);
+      unlockBody!.unlocked_ids.map(String),
+      `the seed entry (${seedEntryId}) is in unlocked_ids`,
+    ).toContain(seedEntryId);
+    // Success toast — "Week unlocked".
+    await expect(
+      page.getByText(/week unlocked/i).first(),
+      'the UI shows a "Week unlocked" success toast',
+    ).toBeVisible({ timeout: 15_000 });
 
-    // The period reopens: read the EMPLOYEE's row via the RBAC-visible LIST (admin
-    // is signed in; the single GET is self-only). Assert status "open" + reopened_at
-    // set — the recompute (D4) stamps reopened_at on the locked→open drop.
+    // The period reopens: read bob's row via the RBAC-visible LIST (admin signed in;
+    // the single GET is self-only). Assert status "open" + reopened_at set.
     let reopened: PeriodShape | undefined;
     const reopenDeadline = Date.now() + 12_000;
     do {
@@ -692,39 +750,36 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
     } while (Date.now() < reopenDeadline);
     expect(
       reopened?.status,
-      `after admin unlock-week, the employee's period ${curToken} is "open" (got ${JSON.stringify(reopened)})`,
+      `after the UI unlock-week, bob's period ${curToken} is "open" (got ${JSON.stringify(reopened)})`,
     ).toBe('open');
     expect(reopened!.reopened_at, 'reopened_at is set after unlock-week').toBeTruthy();
     // eslint-disable-next-line no-console
     console.log(
-      `[FEAT-002] step4 unlock → status=${unlockResp!.status} unlocked_ids=${JSON.stringify(unlockResp!.body.unlocked_ids)} period now=${reopened!.status} reopened_at=${reopened!.reopened_at}`,
+      `[FEAT-002] step4 UI unlock → ${unlockStatus} unlocked_ids=${JSON.stringify(unlockBody!.unlocked_ids)}; period now=${reopened!.status} reopened_at=${reopened!.reopened_at}`,
     );
 
     // =====================================================================
-    // STEP 4b — WRITABILITY RESTORED: the employee can createManual into the week
-    // again. Sign back in as the employee and create a manual entry NOW (in the
-    // reopened week) → 200. This also RESTORES the seed's writability.
+    // STEP 4b — WRITABILITY RESTORED: bob can write into the reopened week again.
+    // Sign back in as bob and createManual NOW (in the reopened week) → 2xx. This
+    // also RESTORES the seed's writability.
     // =====================================================================
     await page.context().clearCookies();
     await waitForAuthWindow();
     markAuthBudgetSpent();
-    await signInAs(page, { actorKey: 'alice' });
+    await signInAs(page, { actorKey: 'bob' });
     await expectAuthedShell(page);
 
-    // WEDNESDAY of the current week — a different week-day than the seed (Monday)
-    // so the writeback can never overlap it; still inside the reopened week.
-    const wbWin = uniqueWindow(new Date(), 2);
-    const writeBack = await apiCall(page, 'POST', '/v1/time-entries', {
-      project_id: projectA,
-      start_at: wbWin.startIso,
-      end_at: wbWin.endIso,
+    const wbWin = uniqueWindow(new Date(), 2); // WEDNESDAY of the current week (≠ seed day)
+    const writeBack = await createManualApi(page, {
+      projectId: projectA,
+      startIso: wbWin.startIso,
+      endIso: wbWin.endIso,
       notes: `feat002 writeback ${Date.now()}`,
     });
     expect(
       writeBack.status,
       `createManual into the REOPENED week is 2xx — lock released (got ${writeBack.status}); body=${JSON.stringify(writeBack.body)}`,
     ).toBeLessThan(300);
-    // The week is open again (the writeback added a draft → still open).
     const finalPeriod = await getPeriod(page, curToken);
     expect(['open', 'rejected'], 'the operated week is left WRITABLE (state restored)').toContain(
       finalPeriod.status,
@@ -735,8 +790,6 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
     // =====================================================================
     await expectAuthedShell(page);
     const postAuthLoginBounces = navs.slice(navsAtAuth).filter((u) => /\/login(\?|$)/.test(u));
-    // The deliberate sign-out+sign-in cycles (admin, then employee-again) route
-    // through /login; that is EXPECTED. The guard is: no /me storm + no 429.
     const me429 = meStatuses.filter((s) => s === 429).length;
     expect(me429, 'no 429 on /me during the flow (INC-003/INC-005)').toBe(0);
     expect(meStatuses.length, `bounded /me count (no storm) — saw ${meStatuses.length}`).toBeLessThan(
@@ -745,15 +798,15 @@ test.describe('FEAT-002 — period lock lifecycle (live)', () => {
 
     // eslint-disable-next-line no-console
     console.log(
-      '\n===== FEAT-002 LIVE LIFECYCLE — summary =====\n' +
-        `  week under test: ${curToken} (${emp.displayName}, ${tz})\n` +
-        `  step1 submit:  200 submitted_ids=${JSON.stringify(submitBody.submitted_ids)}; period→submitted (API; UI banner + New-entry disabled asserted)\n` +
-        `  step2 locked:  create=${lockedCreate.status}/${lockedCreate.body?.code}, delete=${lockedDelete.status}/${lockedDelete.body?.code}, start=${lockedStart.status}/${lockedStart.body?.code} (UI: friendly banner, no raw code)\n` +
+      '\n===== FEAT-002 LIVE LIFECYCLE (UI BUTTONS) — summary =====\n' +
+        `  week under test: ${curToken} (${emp.displayName} [plain employee], ${tz})\n` +
+        `  step1 submit:  ${submitStatus} via UI BUTTON; submitted_ids=${JSON.stringify(submitBody!.submitted_ids)}; period→submitted; locked banner + New-entry disabled\n` +
+        `  step2 locked:  create=${lockedCreate.status}/${lockedCreate.body?.code}, delete=${lockedDelete.status}/${lockedDelete.body?.code}, start=${lockedStart.status}/${lockedStart.body?.code}; UI friendly banner, no raw code\n` +
         `  step3 future:  ${futCreate.status} into ${futToken} (open — never locked)\n` +
-        `  step4 unlock:  ${unlockResp!.status} via ${unlockVia.toUpperCase()} unlocked_ids=${JSON.stringify(unlockResp!.body.unlocked_ids)}; period→open (reopened_at set)\n` +
+        `  step4 unlock:  ${unlockStatus} via UI BUTTON (UnlockWeekButton on /approvals, enriched queue row); period→open (reopened_at set)\n` +
         `  step4b write:  ${writeBack.status} into reopened week → state RESTORED (now ${finalPeriod.status})\n` +
         `  /me 429s=${me429}; post-auth /login routes=${postAuthLoginBounces.length} (deliberate re-logins)\n` +
-        '=============================================\n',
+        '==========================================================\n',
     );
   });
 });

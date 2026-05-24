@@ -591,7 +591,23 @@ function routeRequest(
       return rbacForbidden();
     }
     const items = Array.from(state.entries.values()).filter((e) => e.user_id === userId);
-    return { status: 200, body: { items, next_cursor: null } };
+    // GET /v1/time-entries is OFFSET-paginated: rows live under the `{ data, page,
+    // page_size, total_count }` envelope (OffsetPaginated), NOT `{ items }`. The
+    // /timesheets page reads `entriesQuery.data?.data` (the FEAT-002 envelope-read
+    // fix), so the mock MUST return `{ data }` or the week table renders empty in
+    // hermetic mode. (Kept `items` as a duplicate alias so any older reader still
+    // works; the canonical key is `data`.)
+    return {
+      status: 200,
+      body: {
+        data: items,
+        items,
+        page: 1,
+        page_size: items.length,
+        total_count: items.length,
+        next_cursor: null,
+      },
+    };
   }
   if (path === '/v1/time-entries/start' && method === 'POST') {
     const idemKey = req.headers()['idempotency-key'];
@@ -883,7 +899,12 @@ function routeRequest(
         submitted_at: new Date().toISOString(),
       });
     }
-    return { status: 200, body: { items, next_cursor: null } };
+    // GET /v1/approvals/queue returns the enriched ApprovalQueueItem rows under the
+    // `{ data }` envelope (the pinned FEAT-002 contract). The approvals page reads
+    // `queue.data?.data` (the envelope-read fix), so the mock MUST return `{ data }`
+    // or the queue renders empty + the per-row UnlockWeekButton is unreachable in
+    // hermetic mode. (Kept `items` as a duplicate alias for safety.)
+    return { status: 200, body: { data: items, items, next_cursor: null } };
   }
   if (path === '/v1/approvals/timesheets/manager' && method === 'POST') {
     const ids = (body?.entry_ids as string[]) ?? [];

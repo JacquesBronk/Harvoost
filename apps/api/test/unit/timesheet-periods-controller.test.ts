@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { HTTP_CODE_METADATA } from '@nestjs/common/constants';
 import { TimesheetPeriodsController } from '../../src/timesheet-periods/timesheet-periods.controller';
 import { PeriodService } from '../../src/timesheet-periods/period.service';
 import { ValidationFailedError } from '@harvoost/shared';
@@ -170,6 +171,11 @@ describe('POST /v1/timesheet-periods/{user_id}/{iso_week}/unlock — admin unloc
       reason: 'nothing to unlock but exercising the loop boundary safely here',
     });
     expect(out.unlocked_ids).toEqual([]);
+  });
+
+  it('carries @HttpCode(200) metadata so the runtime status matches the spec (not 201)', () => {
+    const code = Reflect.getMetadata(HTTP_CODE_METADATA, TimesheetPeriodsController.prototype.unlockWeek);
+    expect(code).toBe(200);
   });
 });
 

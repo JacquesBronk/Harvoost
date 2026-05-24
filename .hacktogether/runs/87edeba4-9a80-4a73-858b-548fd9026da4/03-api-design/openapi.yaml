@@ -2055,36 +2055,49 @@ paths:
   /v1/approvals/queue:
     get:
       tags: [Approvals]
-      summary: Approval inbox (Manager sees stage-1; FinMgr sees stage-2)
+      summary: Enriched approval inbox (Manager sees stage-1; FinMgr sees stage-2)
       description: |
-        RBAC-routed. Manager callers see `submitted` entries from anchored users.
-        FinMgr callers see `manager_approved` entries across the org.
+        RBAC-routed. Manager callers see weeks with `submitted` entries from anchored users;
+        FinMgr callers see weeks with `manager_approved` entries across the org. FEAT-002
+        EXPANSION: this endpoint now returns ENRICHED per-(user, ISO-week) rows
+        (`ApprovalQueueItem`) instead of raw per-entry `TimeEntry` rows — one row per submitted
+        timesheet week, carrying the owner's display name, the ISO-week id, the week's total
+        hours, the period status, and when it was submitted. Backs the approvals queue table +
+        the admin per-week unlock button.
       operationId: getApprovalQueue
       parameters:
-        - $ref: '#/components/parameters/Cursor'
+        - in: query
+          name: stage
+          required: false
+          schema:
+            type: string
+            enum: [manager, final]
+          description: |
+            Which approval stage to list. `manager` = stage-1 (weeks with `submitted` entries);
+            `final` = stage-2 (weeks with `manager_approved` entries). Optional — when omitted the
+            stage is inferred from the caller's role.
         - $ref: '#/components/parameters/Limit'
-        - in: query
-          name: user_id
-          schema: { type: integer, format: int64 }
-        - in: query
-          name: iso_week
-          schema: { type: string, pattern: '^\d{4}-W\d{2}$' }
-          description: ISO 8601 week id (e.g. `2026-W21`).
       responses:
         '200':
-          description: Approval queue.
+          description: Enriched approval queue — one row per (user, ISO-week).
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: '#/components/schemas/CursorPaginationMeta'
-                  - type: object
-                    properties:
-                      data:
-                        type: array
-                        items: { $ref: '#/components/schemas/TimeEntry' }
-                      scope_meta: { $ref: '#/components/schemas/ScopeMeta' }
-                    required: [data, scope_meta]
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApprovalQueueItem' }
+                required: [data]
+              example:
+                data:
+                  - id: '3-2026-21'
+                    user_id: '3'
+                    user_name: Bob Example
+                    iso_week: 2026-W21
+                    total_hours: 38.5
+                    status: submitted
+                    submitted_at: 2026-05-22T16:00:00+00:00
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -4191,6 +4204,28 @@ components:
               reason: { type: string }
             required: [entry_id, reason]
       required: [approved_ids, rejected_ids, skipped]
+
+    ApprovalQueueItem:
+      type: object
+      description: |
+        One enriched approval-queue row per (user, ISO-week) — FEAT-002 EXPANSION. Replaces the
+        raw per-entry `TimeEntry` rows the queue previously returned. IDs are string-encoded.
+      properties:
+        id:
+          type: string
+          description: Period id, or the composite `${user_id}-${iso_year}-${iso_week}` when no standalone period id exists.
+        user_id: { type: string, description: String-encoded bigint owner id. }
+        user_name: { type: string, description: The owner's display name (for the queue table + avatar). }
+        iso_week:
+          type: string
+          pattern: '^\d{4}-W\d{2}$'
+          description: ISO 8601 week id in the form `YYYY-Www` (e.g. `2026-W21`).
+        total_hours: { type: number, format: float, description: Total hours in the (user, ISO-week). }
+        status:
+          type: string
+          description: The period status for the week — `submitted` (stage-1 pending) or `manager_approved` (stage-2 pending).
+        submitted_at: { type: string, format: date-time, description: When the week was submitted for approval. }
+      required: [id, user_id, user_name, iso_week, total_hours, status, submitted_at]
 
     # ---------- Exceptions ----------
     Exception:

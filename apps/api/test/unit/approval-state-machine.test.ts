@@ -31,8 +31,11 @@ function makeController(state: MockState) {
     assertPeriodWritable: vi.fn(async () => undefined),
     recomputePeriod: vi.fn(async () => undefined),
   };
+  // FEAT-002 expansion: queue() needs RbacScopeService; the transitions here don't use it.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods as any);
+  const rbac = { getVisibleUserIds: async () => ({ userIds: [], meta: { fromProjects: 0, fromPersons: 0 }, unrestricted: true }), assertCanSeeUser: async () => undefined } as any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new ApprovalsController(prisma as any, { record: async () => undefined } as any, periods as any, rbac);
 }
 
 describe('Approval state machine — manager approve/reject (REQUIREMENTS F6.1)', () => {

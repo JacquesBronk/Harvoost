@@ -42,6 +42,16 @@
 //     `{ data: TimesheetPeriod[] }`, so shape 'paginated-data' + envelopeKey
 //     'data' resolves the per-row period schema.
 //
+// FEAT-002 EXPANSION (issue #6) rebuilds GET /v1/approvals/queue from raw
+// per-entry TimeEntry rows into ENRICHED per-(user, ISO-week) rows. The 200 body
+// is `{ data: ApprovalQueueItem[] }`, so shape 'paginated-data' + envelopeKey
+// 'data' resolves the per-row ApprovalQueueItem schema. `reads` is the full set
+// the approvals page (apps/web/app/approvals/page.tsx + .../final/page.tsx)
+// consumes off each row — it would have FAILED against the old raw-row spec that
+// lacked user_name / iso_week / total_hours. The `stage` query key is now a
+// DECLARED param of the operation, so its stale KNOWN_PARAM_DRIFT entry is removed
+// below.
+//
 // Three allowlists carry pre-existing, OUT-OF-SCOPE debt on endpoints the
 // INC-004 lanes are NOT touching, so the suite stays green for the hotfix while
 // still flagging the debt in the log. NEW drift on any other endpoint still
@@ -205,6 +215,24 @@ export const LOAD_BEARING: EnvelopeExpectation[] = [
     shape: 'paginated-data',
     reads: ['id', 'user_id', 'iso_year', 'iso_week', 'status', 'entry_counts'],
   },
+  {
+    // FEAT-002 EXPANSION (issue #6): GET /v1/approvals/queue, REBUILT this
+    // expansion from raw per-entry TimeEntry rows into ENRICHED per-(user,
+    // ISO-week) ApprovalQueueItem rows. The 200 body is `{ data:
+    // ApprovalQueueItem[] }`, so shape 'paginated-data' + envelopeKey 'data'
+    // resolves the per-row ApprovalQueueItem schema. `reads` is the full set the
+    // approvals pages consume off each row (apps/web/app/approvals/page.tsx maps
+    // r.user_name / r.iso_week / r.total_hours / r.status / r.submitted_at and
+    // keys on r.id; the admin unlock-week button reads r.user_id + r.iso_week).
+    // FAILS the build if the spec drops any of these — it WOULD have failed
+    // against the old raw-row spec (TimeEntry rows lack user_name / iso_week /
+    // total_hours). The `stage` query key is now a DECLARED param, so its stale
+    // KNOWN_PARAM_DRIFT entry has been removed.
+    key: 'GET /v1/approvals/queue',
+    envelopeKey: 'data',
+    shape: 'paginated-data',
+    reads: ['id', 'user_id', 'user_name', 'iso_week', 'total_hours', 'status', 'submitted_at'],
+  },
 ];
 
 /**
@@ -215,9 +243,6 @@ export const LOAD_BEARING: EnvelopeExpectation[] = [
 export const KNOWN_PARAM_DRIFT: Record<string, string[]> = {
   // timesheets/page.tsx still sends ISO start_at_*; spec uses date_from/date_to.
   'GET /v1/time-entries': ['start_at_from', 'start_at_to'],
-  // approvals queue FE sends `stage`; spec models the inbox as RBAC-routed
-  // (Manager=stage1 / FinMgr=stage2) with no `stage` param.
-  'GET /v1/approvals/queue': ['stage'],
   // leave list FE sends `mine`; spec scopes by RBAC + a `user_id` filter only.
   'GET /v1/leave/requests': ['mine'],
 };
