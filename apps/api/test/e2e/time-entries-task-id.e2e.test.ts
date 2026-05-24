@@ -341,4 +341,31 @@ describe('time-entries read endpoints return project_name/task_name (INC-009, #2
     expect(running!.task_name).toBeNull();
     expect(running!.project_name).toBe(seededProjectName);
   });
+
+  // #21 follow-up — the list SELECT also computes `hours` from (end_at - start_at).
+  // A running entry has no end_at, so hours is null (UI renders "—"); a stopped/closed
+  // entry returns a real number. Before this, the Hours column was "—" for every row.
+  it('list() returns numeric hours for a stopped entry; null while running', async () => {
+    if (!dbReady) {
+      console.warn('[skip] seeded fixture not reachable — skipping hours case');
+      return;
+    }
+    await ctrl.start(EMPLOYEE, randomUUID(), { project_id: TEST_PROJECT_ID });
+
+    // While running (end_at null) the computed hours is null.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let res = await ctrl.list(EMPLOYEE, { limit: 50 } as any);
+    let row = (res.data as Array<Record<string, unknown>>).find((r) => r.status === 'running');
+    expect(row).toBeDefined();
+    expect(row!.hours).toBeNull();
+
+    // After stopping, the entry is closed and hours is a real (>= 0) number.
+    await ctrl.stop(EMPLOYEE, randomUUID(), {});
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    res = await ctrl.list(EMPLOYEE, { limit: 50 } as any);
+    row = (res.data as Array<Record<string, unknown>>).find((r) => r.status !== 'running');
+    expect(row).toBeDefined();
+    expect(typeof row!.hours).toBe('number');
+    expect(row!.hours as number).toBeGreaterThanOrEqual(0);
+  });
 });

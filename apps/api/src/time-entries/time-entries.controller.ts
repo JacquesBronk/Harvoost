@@ -141,7 +141,8 @@ export class TimeEntriesController {
     const sql = `
       SELECT te.id, te.user_id, te.project_id, p.name AS project_name,
              te.task_id, pt.name AS task_name,
-             te.notes, te.start_at, te.end_at, te.status, te.billable
+             te.notes, te.start_at, te.end_at, te.status, te.billable,
+             (EXTRACT(EPOCH FROM (te.end_at - te.start_at)) / 3600.0)::double precision AS hours
       FROM time_entries te
       JOIN projects p ON p.id = te.project_id
       LEFT JOIN project_tasks pt ON pt.id = te.task_id
