@@ -8,6 +8,10 @@
 //     (the `reads` list below), at the documented envelope key (`items`/`data`).
 // This is what would have caught Rows 1-2's items/project_name/hours drift.
 //
+// INC-006 extends the same mechanism (no new framework) to GET /v1/users so the
+// list-item `roles` field-level drift that crashed /admin/users is caught at
+// build time too — see the entry at the end of LOAD_BEARING.
+//
 // Three allowlists carry pre-existing, OUT-OF-SCOPE debt on endpoints the
 // INC-004 lanes are NOT touching, so the suite stays green for the hotfix while
 // still flagging the debt in the log. NEW drift on any other endpoint still
@@ -82,6 +86,30 @@ export const LOAD_BEARING: EnvelopeExpectation[] = [
     envelopeKey: '',
     shape: 'object',
     reads: ['project_id', 'rate', 'currency', 'effective_from'],
+  },
+  {
+    // INC-006: /admin/users crashed because the GET /v1/users list response
+    // omitted `roles` while apps/web/app/admin/users/page.tsx reads it unguarded
+    // (RolesCell -> user.roles.map/.length, and roleSet(user) seeds the role
+    // editor). Same response envelope as cost-/billable-rates: the success
+    // schema is OffsetPaginationMeta allOf { data: User[] }, so `paginated-data`
+    // + envelopeKey 'data' resolves the per-row User schema. `reads` is the full
+    // set the Users page consumes off each row; `roles` is the load-bearing
+    // field this incident is about. This entry FAILS the build if the spec's
+    // list-item User schema ever drops any of these (it would have failed
+    // against the pre-fix spec/contract that did not cover this endpoint).
+    key: 'GET /v1/users',
+    envelopeKey: 'data',
+    shape: 'paginated-data',
+    reads: [
+      'id',
+      'email',
+      'display_name',
+      'timezone',
+      'weekly_summary_opt_out',
+      'is_active',
+      'roles',
+    ],
   },
 ];
 

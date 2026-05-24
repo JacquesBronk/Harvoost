@@ -24,14 +24,27 @@ export class UsersController {
     const p = Math.max(parseInt(page, 10) || 1, 1);
     const ps = Math.min(Math.max(parseInt(pageSize, 10) || 50, 1), 200);
     const offset = (p - 1) * ps;
+    // INC-006: include `roles` per user (mirror GET /v1/auth/me). Aggregated in a
+    // single query via LEFT JOIN + array_agg — NO N+1. The FILTER clause drops the
+    // NULL produced for users with zero roles so they yield '{}' (empty array),
+    // never [null]; COALESCE handles the all-NULL group. Pagination/order unchanged.
     const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT id, email, display_name, timezone, weekly_summary_opt_out, is_active, created_at
-       FROM users ORDER BY display_name LIMIT $1::int OFFSET $2::int`,
+      `SELECT u.id, u.email, u.display_name, u.timezone, u.weekly_summary_opt_out, u.is_active, u.created_at,
+              COALESCE(array_agg(ur.role) FILTER (WHERE ur.role IS NOT NULL), '{}') AS roles
+       FROM users u
+       LEFT JOIN user_roles ur ON ur.user_id = u.id
+       GROUP BY u.id
+       ORDER BY u.display_name LIMIT $1::int OFFSET $2::int`,
       ps,
       offset,
     );
+    // Normalize roles to a clean string[] (String()-mapped, mirroring /v1/auth/me).
+    const data = rows.map((row) => ({
+      ...row,
+      roles: Array.isArray(row.roles) ? row.roles.map((r) => String(r)) : [],
+    }));
     const total = await this.prisma.$queryRawUnsafe<Array<{ c: unknown }>>(`SELECT COUNT(*)::int AS c FROM users`);
-    return { data: rows, page: p, page_size: ps, total_count: Number(total[0]?.c ?? 0) };
+    return { data, page: p, page_size: ps, total_count: Number(total[0]?.c ?? 0) };
   }
 
   @Get(':id')

@@ -33,6 +33,7 @@ import type {
   User,
 } from '@/lib/api-types.js';
 import { COMMON_IANA_TIMEZONES, isKnownTimezone } from '@/lib/tz-list.js';
+import { RolesCell, roleSet } from './roles-cell.js';
 
 const ALL_ROLES: Role[] = ['admin', 'finmgr', 'manager', 'employee'];
 const PAGE_SIZE = 50;
@@ -135,7 +136,7 @@ export default function AdminUsersPage() {
   async function submitRolesEditor() {
     if (!rolesEditor) return;
     const { user, draft } = rolesEditor;
-    const current = new Set(user.roles);
+    const current = roleSet(user);
     const toAdd = [...draft].filter((r) => !current.has(r));
     const toRemove = [...current].filter((r) => !draft.has(r));
 
@@ -278,17 +279,7 @@ export default function AdminUsersPage() {
                     </div>
                   </TD>
                   <TD>
-                    <div className="flex flex-wrap gap-1">
-                      {user.roles.length === 0 ? (
-                        <span className="text-xs text-neutral-400">No roles</span>
-                      ) : (
-                        user.roles.map((r) => (
-                          <Badge key={r} tone="neutral" className="capitalize">
-                            {r}
-                          </Badge>
-                        ))
-                      )}
-                    </div>
+                    <RolesCell user={user} />
                   </TD>
                   <TD className="font-mono text-xs">{user.timezone}</TD>
                   <TD>
@@ -311,7 +302,7 @@ export default function AdminUsersPage() {
                         onClick={() =>
                           setRolesEditor({
                             user,
-                            draft: new Set(user.roles),
+                            draft: roleSet(user),
                             submitting: false,
                           })
                         }
