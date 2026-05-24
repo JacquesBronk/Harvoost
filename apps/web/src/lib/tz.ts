@@ -48,20 +48,31 @@ export function formatHours(hours: number | null | undefined): string {
   return `${hours.toFixed(1)}h`;
 }
 
-/** Return ISO start/end (UTC) for the ISO week containing `localDate` in `zone`. */
+/**
+ * Return the ISO week containing `localDate` in `zone`. Exposes both:
+ *   - `startIso` / `endIso`: UTC ISO bounds (start inclusive, end exclusive
+ *     = next Monday) for callers that filter on full timestamps; and
+ *   - `from` / `to`: the inclusive local-date bounds (`YYYY-MM-DD`, Mon → Sun)
+ *     that the `date_from` / `date_to` query params expect — same shape and
+ *     Mon→Sun convention as `currentIsoWeekRange`, but ANCHORED to `localDate`
+ *     so the /timesheets Prev/Next navigation stays correct.
+ */
 export function isoWeekRange(
   localDate: Date | string,
   zone: string = viewerTimeZone(),
-): { startIso: string; endIso: string; weekLabel: string } {
+): { startIso: string; endIso: string; from: string; to: string; weekLabel: string } {
   const dt =
     typeof localDate === 'string'
       ? DateTime.fromISO(localDate, { zone })
       : DateTime.fromJSDate(localDate, { zone });
   const start = dt.startOf('week'); // ISO Mon
-  const end = start.plus({ days: 7 });
+  const end = start.plus({ days: 7 }); // next Mon (exclusive)
+  const lastDay = start.plus({ days: 6 }); // Sun (inclusive)
   return {
     startIso: start.toUTC().toISO() ?? '',
     endIso: end.toUTC().toISO() ?? '',
+    from: start.toISODate() ?? '',
+    to: lastDay.toISODate() ?? '',
     weekLabel: `W${start.weekNumber} • ${start.toFormat('dd LLL')} – ${end
       .minus({ days: 1 })
       .toFormat('dd LLL yyyy')}`,

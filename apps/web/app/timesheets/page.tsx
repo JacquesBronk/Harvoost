@@ -47,14 +47,23 @@ export default function TimesheetsPage() {
   const [newEntryOpen, setNewEntryOpen] = useState(false);
   const week = useMemo(() => isoWeekRange(anchorIso ?? '', zone), [anchorIso, zone]);
 
+  // `GET /v1/time-entries` honors `date_from` / `date_to` as inclusive
+  // `YYYY-MM-DD` local dates (backend ListQuery regex `^\d{4}-\d{2}-\d{2}$`;
+  // openapi declares the same) — NOT `start_at_from` / `start_at_to`, which the
+  // backend silently ignores. Sending the ignored params listed ALL of the
+  // user's entries, so the table spanned every week and `hasDraft` / the
+  // Submit-week anchor could lock the WRONG week off a stale future-week draft.
+  // We send the SAME Mon→Sun bounds the period banner + week label derive from
+  // `week` (anchored to `anchorIso`), so the listed entries, the period status,
+  // and the Submit-week anchor all agree on the displayed week.
   const entriesQuery = useQuery({
-    queryKey: ['time-entries', 'own', week.startIso, week.endIso],
+    queryKey: ['time-entries', 'own', week.from, week.to],
     queryFn: () =>
       apiFetch<OffsetPaginated<TimeEntry>>('/v1/time-entries', {
         query: {
           user_id: user?.id,
-          start_at_from: week.startIso,
-          start_at_to: week.endIso,
+          date_from: week.from,
+          date_to: week.to,
           limit: 200,
         },
       }),
