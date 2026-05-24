@@ -1,11 +1,22 @@
 # Harvoost full local stack — dev infrastructure + app services.
 #
-# Usage:
-#   docker compose up -d --build      # boots EVERYTHING (postgres, azurite, maildev,
-#                                     # keycloak, migrate-and-seed, api, web)
+# Usage (TURNKEY — no manual setup, no .env to copy):
+#   docker compose up -d              # boots EVERYTHING, migrates + seeds the DB,
+#                                     # and serves the app at http://localhost:3000.
+#                                     # On a fresh clone this also BUILDS the api/web
+#                                     # images (compose builds any missing image).
+#   docker compose up -d --build      # add --build after changing app SOURCE (compose
+#                                     # reuses an existing image and won't rebuild on its own).
 #   docker compose --profile llm up -d  # also boots ollama for local LLM testing
 #   docker compose down               # stops everything; volumes preserved
-#   docker compose down -v            # ALSO removes volumes (destroys local data)
+#   docker compose down -v            # ALSO removes volumes (destroys local data + the
+#                                     # seeded DB + the imported Keycloak realm)
+#
+# Env: the committed .env.example holds working dev defaults and is loaded as the
+# base env for every app service, so NO `.env` is required to boot. An optional
+# .env (gitignored) is overlaid on top when present, so developers can override
+# individual values (e.g. OIDC_DISPLAY_NAME=Keycloak, real secrets) without it
+# being mandatory. See the `x-app-env-file` anchor below.
 #
 # Service start order (compose enforces via depends_on conditions):
 #   postgres + keycloak + azurite + maildev   →  healthy
@@ -13,15 +24,29 @@
 #   api                                        →  starts after migrate completes
 #   web                                        →  starts after api is healthy
 #
-# Networking note: api/web/migrate use `network_mode: host`. On WSL2 + Docker
-# Desktop they share the WSL2 VM's network namespace, so `localhost:5432`
-# (postgres), `localhost:8080` (keycloak), and the api's `localhost:3001`
-# resolve to the same loopback the browser uses. This makes the OIDC iss claim
-# (`http://localhost:8080/realms/harvoost`) match between browser-issued tokens
-# and api-side validation — without this, a bridge-network setup would need
-# /etc/hosts trickery for Keycloak to advertise a single canonical issuer URL.
+# Networking: app services (migrate/api/web) run on the default compose bridge
+# network and reach infra by compose service DNS names (postgres:5432,
+# azurite:10000, etc.). Browser-facing values stay on localhost via the
+# published 127.0.0.1 port mappings. The catch is the OIDC `iss` claim: the
+# browser and the api must see the SAME Keycloak issuer hostname. So the api maps
+# `harvoost.localhost` → host-gateway (`extra_hosts`) and uses
+# OIDC_ISSUER_URL=http://harvoost.localhost:8080/realms/harvoost, while the
+# browser resolves the same `harvoost.localhost` to 127.0.0.1 via the RFC-6761
+# .localhost TLD magic — so tokens validate on both sides without /etc/hosts edits.
 #
 # All exposed infra services bind to 127.0.0.1 only. Do not expose externally.
+
+# Base env for every app service: .env.example (committed dev defaults, REQUIRED)
+# with an optional developer .env overlaid on top (later file wins). This is what
+# makes `docker compose up -d` work on a fresh clone with zero setup. Note:
+# per-service `environment:` blocks below still override BOTH files (compose
+# precedence: environment > env_file), which is how the bridge-network DB/OIDC/CORS
+# values get applied regardless of what the env files say.
+x-app-env-file: &app-env-file
+  - path: .env.example
+    required: true
+  - path: .env
+    required: false
 
 services:
   postgres:
@@ -57,7 +82,10 @@ services:
     volumes:
       - azurite-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 10000 || exit 1"]
+      # 127.0.0.1 (not `localhost`): azurite listens on IPv4 0.0.0.0 only, but
+      # `localhost` resolves to IPv6 ::1 first in this image → the check would
+      # fail and the container would sit perpetually `unhealthy`.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,7 +101,7 @@ services:
       - "127.0.0.1:1080:1080"  # Web UI
       - "127.0.0.1:1025:1025"  # SMTP
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 1080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 1080 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -153,7 +181,7 @@ services:
       dockerfile: docker/Dockerfile.api
     image: harvoost-api:dev
     container_name: harvoost-migrate
-    env_file: .env
+    env_file: *app-env-file
     environment:
       # Override .env localhost values with bridge-network DNS names.
       DATABASE_URL: postgresql://harvoost:dev@postgres:5432/harvoost?sslmode=disable
@@ -171,7 +199,7 @@ services:
       dockerfile: docker/Dockerfile.api
     image: harvoost-api:dev
     container_name: harvoost-api
-    env_file: .env
+    env_file: *app-env-file
     environment:
       # Override .env localhost values: postgres + maildev reached via Docker DNS;
       # blob via azurite service name; keycloak via the shared harvoost.localhost
@@ -181,6 +209,10 @@ services:
       BLOB_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
       CORS_ALLOWED_ORIGINS: http://localhost:3000
       # Cookie-auth: the web sends Origin=http://localhost:3000 — matches above.
+      # The dockerized dev IdP IS Keycloak — advertise it on the login page
+      # (GET /v1/auth/idp-info) regardless of env files, so no dev .env is needed
+      # just to override the .env.example prod default ("Microsoft Entra ID").
+      OIDC_DISPLAY_NAME: Keycloak
     extra_hosts:
       # Maps harvoost.localhost inside the api container to the Docker host's
       # gateway IP, which forwards via the keycloak port mapping above. The
@@ -220,7 +252,7 @@ services:
         NEXT_PUBLIC_WEB_BASE_URL: http://localhost:3000
     image: harvoost-web:dev
     container_name: harvoost-web
-    env_file: .env
+    env_file: *app-env-file
     environment:
       # Override the .env PORT=3001 (which is the api's port).
       PORT: "3000"
